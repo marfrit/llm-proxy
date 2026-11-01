@@ -69,7 +69,7 @@ import hashlib
 import math
 
 # Die eigene Version; geht in die Startzeile und in die Release-Notiz.
-__version__ = "1.3.0"
+__version__ = "1.3.1"
 
 # feyntalk: the optional renderer dependency. The proxy runs without it;
 # token mode is then unavailable and says so once (see _feyntalk_unavailable).
@@ -111,6 +111,21 @@ _FEYNTALK_WARNED = set()         # one log line per distinct reason/Capability
 # fuer die Groessenschaetzung (der /props-Probe fehlt eine Tokenzahl).
 FEYNTALK_THINK_DROP_FRACTION = float(os.environ.get("FEYNTALK_THINK_DROP_FRACTION", "0.7"))
 FEYNTALK_CHARS_PER_TOKEN = float(os.environ.get("FEYNTALK_CHARS_PER_TOKEN", "3.0"))
+# Ab welchem Anteil der Drop-Schwelle der exakte Tokenzaehler der Engine
+# befragt wird (POST /tokenize, siehe _feyntalk_exact_tokens). chars/3.0
+# ueberschaetzte im gemessenen Fall (2026-11-01, Qwen3.8 Flash-Next, 131072 ctx)
+# um ~1,5x: ein Render mit 0,8 * Schwelle kann real noch ueber der Schwelle
+# liegen. Unterhalb von 0,8 ist selbst diese Ueberschaetzung so weit von der
+# Schwelle entfernt, dass keine Entscheidung kippen kann -- der zusaetzliche
+# Aufruf (eine Runde) waere dort nur Last ohne Ergebnis.
+FEYNTALK_TOKENIZE_PRE_FRACTION = float(os.environ.get("FEYNTALK_TOKENIZE_PRE_FRACTION", "0.8"))
+FEYNTALK_TOKENIZE_TIMEOUT = 3.0   # ein Zaehler, kein Turn; bei Frist gilt der Rueckfall unten
+# Je Backend das zuletzt beobachtete Verhaeltnis exact/Schaetzung (ein float).
+# Faellt /tokenize einmal aus, wird die Schaetzung damit skaliert, statt roh
+# ueber die Schwelle zu laufen: eine behaltene Entscheidung kann so nicht an
+# einem einzelnen Fehlschlag umkippen (genau den Re-Prefill, den diese Fassung
+# vermeiden soll). Ein Wert je Backend, also keine Historie und kein Wachstum.
+_FEYNTALK_TOKEN_RATIO = {}
 # Handshake: Token-Modus nur mit kompatibler Kette. Der Renderer ist eine
 # Python-Abhaengigkeit (Paketversion), die Engine meldet sich in /props.
 FEYNTALK_MIN_RENDERER_VERSION = "1.0.0"
@@ -1812,6 +1827,7 @@ def _feyntalk_capability(backend, setting=None):
                            f"feyntalk: {name} /props has no chat_template_caps; "
                            "tool-call arguments stay strings")
     result = {"mode": "tokens", "hash": material_hash,
+              "name": name, "host": host, "port": port,
               "material": known["material"], "renderer": known["renderer"],
               "template_source": material["chat_template"].get("source"),
               # The engine's minja capability: a template that iterates the
@@ -2344,14 +2360,59 @@ def _feyntalk_client_preserve_responses(request):
     return value
 
 
-def _feyntalk_think_policy(cap, messages, tools, enable, override, model):
+def _feyntalk_exact_tokens(cap, rendered, auth):
+    """Der exakte Prompt-Zaehler der Engine (POST /tokenize), (count|None, reason).
+
+    Der behaltene Render ist bereits die exakte Prompt-Zeichenkette; die Engine
+    zaehlt sie mit ihrem eigenen Tokenizer. `content` ist der llama-server-nahe
+    Rumpf, die Antwort traegt die Zahl (auch als `count`; aeltere Engines geben
+    nur `tokens`, dann ist dessen Laenge die Zahl). None heisst: die Schaetzung
+    bleibt; ein Zaehler ist nie ein Fehlergrund fuer die Anfrage."""
+    host, port = cap.get("host"), cap.get("port")
+    if not host or not port:
+        return None, "no backend address"
+    conn = None
+    try:
+        raw = json.dumps({"content": rendered.text}).encode("utf-8")
+        headers = {"Content-Type": "application/json", "Content-Length": str(len(raw))}
+        if auth:
+            headers["Authorization"] = auth
+        conn = http.client.HTTPConnection(host, port, timeout=FEYNTALK_TOKENIZE_TIMEOUT)
+        conn.request("POST", "/tokenize", body=raw, headers=headers)
+        resp = conn.getresponse()
+        payload = resp.read()
+        if resp.status != 200:
+            return None, f"status {resp.status}"
+        doc = json.loads(payload)
+        count = doc.get("count")
+        if not isinstance(count, int) or isinstance(count, bool):
+            tokens = doc.get("tokens")
+            count = len(tokens) if isinstance(tokens, list) else None
+        if not isinstance(count, int) or count < 0:
+            return None, "no count in the answer"
+        return count, None
+    except Exception as e:  # noqa: BLE001 - der Zaehler darf die Anfrage nie kippen
+        return None, f"{type(e).__name__}: {e}"
+    finally:
+        try:
+            if conn:
+                conn.close()
+        except Exception:
+            pass
+
+
+def _feyntalk_think_policy(cap, messages, tools, enable, override, model, auth=None):
     """Denken behalten oder als erste Kompaktierungsstufe fallen lassen.
 
     Rueckgabe (preserve, rendered, mode): preserve True/False/None (None = die
     Faehigkeit fehlt, es wird keine Flagge gesendet), rendered der zu sendende
-    Render, mode kept|dropped|off. Die Entscheidung faellt auf der Groesse des
-    preserve=true-Renders; innerhalb einer Sitzung waechst er nur, also kann
-    sie nicht flackern."""
+    Render, mode kept|dropped|off (bei automatischer Entscheidung mit der
+    Herkunft der Zahl: kept(exact)/kept(estimate)/...). Die Entscheidung faellt
+    auf der Groesse des preserve=true-Renders; der exakte Zaehler ist pro Prompt
+    deterministisch, und wenn er einmal ausfaellt, wird die Schaetzung mit dem
+    zuletzt beobachteten exact/Schaetzung-Verhaeltnis dieses Backends skaliert --
+    so bleibt eine einmal getroffene Entscheidung stabil, statt an einem
+    einzelnen Fehlschlag zu kippen."""
     if enable is False or not cap.get("supports_preserve_thinking"):
         return None, _feyntalk_render(cap, messages, tools, enable), "off"
     if override is not None:
@@ -2366,14 +2427,40 @@ def _feyntalk_think_policy(cap, messages, tools, enable, override, model):
         return True, rendered, "kept"
     est = len(rendered.text) / FEYNTALK_CHARS_PER_TOKEN
     limit = n_ctx * FEYNTALK_THINK_DROP_FRACTION
-    if est > limit:
+    name = cap.get("name", cap["hash"])
+    count, source = est, "estimate"
+    if est >= limit * FEYNTALK_TOKENIZE_PRE_FRACTION:
+        # Die Schaetzung ist nah genug an der Schwelle, dass chars/3.0 sie
+        # verfehlen kann: die Engine exakt zaehlen lassen und auf DIESER Zahl
+        # entscheiden. Faellt sie aus, wird die Schaetzung mit dem letzten
+        # exact/Schaetzung-Verhaeltnis dieses Backends skaliert; ohne ein
+        # solches Verhaeltnis bleibt es bei der rohen Schaetzung (eine Zeile je
+        # Backend, nie ein Fehler). Das Verhaeltnis haengt am Material-Hash, nicht
+        # am Backend-Namen: nach einem Modellwechsel unter demselben Namen gilt das
+        # alte Tokenizer-Verhaeltnis nicht mehr.
+        exact, why = _feyntalk_exact_tokens(cap, rendered, auth)
+        if exact is not None:
+            count, source = float(exact), "exact"
+            if est > 0:
+                _FEYNTALK_TOKEN_RATIO[cap["hash"]] = exact / est
+        else:
+            ratio = _FEYNTALK_TOKEN_RATIO.get(cap["hash"])
+            if ratio is not None:
+                count, source = est * ratio, "estimate, scaled"
+            _feyntalk_log_once(name + "|tokenize",
+                               f"feyntalk: {model} exact token count unavailable "
+                               f"({why}); using the "
+                               + ("scaled estimate" if ratio is not None else "estimate"))
+    if count > limit:
         dropped = _feyntalk_render(cap, messages, tools, enable, False)
+        gezaehlt = (f"{count:.0f} tokens ({source})" if source == "exact"
+                    else f"~{count:.0f} tokens ({source})")
         _feyntalk_log_once(cap["hash"] + "|drop",
-                           f"feyntalk: {model} think dropped: ~{est:.0f} tokens > "
+                           f"feyntalk: {model} think dropped: {gezaehlt} > "
                            f"{limit:.0f} ({n_ctx} ctx x {FEYNTALK_THINK_DROP_FRACTION}); "
                            "stage-1 compaction")
-        return False, dropped, "dropped"
-    return True, rendered, "kept"
+        return False, dropped, "dropped(" + source + ")"
+    return True, rendered, "kept(" + source + ")"
 
 
 def _feyntalk_retry_body(body, preserve, chat):
@@ -2400,7 +2487,7 @@ def _feyntalk_retry_body(body, preserve, chat):
     return json.dumps(request).encode()
 
 
-def _feyntalk_chat_request(body, cap, model, client_stream):
+def _feyntalk_chat_request(body, cap, model, client_stream, auth=None):
     """A Chat Completions body -> the engine's Open Responses request."""
     request = json.loads(body)
     if request.get("n") not in (None, 1):
@@ -2417,7 +2504,8 @@ def _feyntalk_chat_request(body, cap, model, client_stream):
     enable, effort = _feyntalk_enable(model, request, chat=True)
     override = _feyntalk_client_preserve_chat(request)
     preserve, rendered, think = _feyntalk_think_policy(
-        cap, render_messages, tools_render, enable, override, model)
+        cap, render_messages, tools_render, enable, override, model,
+        auth=auth)
 
     out = {"model": model, "input": input_items, "stream": True,
            "arcint": _feyntalk_arcint(cap, rendered, preserve)}
@@ -2447,7 +2535,7 @@ def _feyntalk_chat_request(body, cap, model, client_stream):
             "think": think, "retry_body": _feyntalk_retry_body(body, preserve, True)}
 
 
-def _feyntalk_responses_request(body, cap, model):
+def _feyntalk_responses_request(body, cap, model, auth=None):
     """A Responses body -> the same body with token mode and both hashes."""
     request = json.loads(body)
     if request.get("stream") is not True:
@@ -2461,7 +2549,8 @@ def _feyntalk_responses_request(body, cap, model):
     enable, _effort = _feyntalk_enable(model, request, chat=False)
     override = _feyntalk_client_preserve_responses(request)
     preserve, rendered, think = _feyntalk_think_policy(
-        cap, render_messages, tools_render, enable, override, model)
+        cap, render_messages, tools_render, enable, override, model,
+        auth=auth)
 
     out = dict(request)
     out["stream"] = True
@@ -2481,11 +2570,13 @@ def _feyntalk_model_of(body):
     return model if isinstance(model, str) else ""
 
 
-def _feyntalk_prepare(backend, method, path, body, feyntalk=None):
+def _feyntalk_prepare(backend, method, path, body, feyntalk=None, auth=None):
     """None = the text path, unchanged. A dict = send this token-mode request.
 
     `feyntalk` overrides the backend's own setting for this request (the alias's
-    mode); None keeps the backend setting."""
+    mode); None keeps the backend setting. `auth` ist die Authorization des
+    Anrufers, wie sie auch an die Engine-Routen geht -- /tokenize liegt hinter
+    demselben Schluessel und bekommt darum dieselbe Kopfzeile."""
     name = backend[0]
     if method != "POST" or (_feyntalk_setting(name) if feyntalk is None else feyntalk) == "off":
         return None
@@ -2495,10 +2586,10 @@ def _feyntalk_prepare(backend, method, path, body, feyntalk=None):
     model = _feyntalk_model_of(body)
     try:
         if path in RESPONSES_PATHS:
-            return _feyntalk_responses_request(body, cap, model)
+            return _feyntalk_responses_request(body, cap, model, auth=auth)
         if "/chat/completions" in path:
             is_stream = bool(json.loads(body).get("stream"))
-            return _feyntalk_chat_request(body, cap, model, is_stream)
+            return _feyntalk_chat_request(body, cap, model, is_stream, auth=auth)
         return None
     except _FeyntalkRefusal as e:
         _feyntalk_log_once(name + "|request|" + str(e),
@@ -4600,7 +4691,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
         except OSError:
             pass
         try:
-            token_request = _feyntalk_prepare(backend, method, path, body, feyntalk)
+            token_request = _feyntalk_prepare(backend, method, path, body, feyntalk,
+                                               auth=fwd.get("Authorization"))
             if gone.is_set():
                 # Der Anrufer hat waehrend der Vorbereitung aufgelegt: nichts
                 # an die Engine schicken. Die finally gibt den Slot frei.

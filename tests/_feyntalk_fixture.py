@@ -213,7 +213,9 @@ def chat_text_stream(model):
 
 def start_engine(material, mode="ok", case="answer", caps=None, n_ctx=None,
                  engine_version="1.4.0", contract=1, token_mode="ready",
-                 param="arcint.renderer_mismatch", renderer_delay=0.0):
+                 param="arcint.renderer_mismatch", renderer_delay=0.0,
+                 tokenize_count=None, tokenize_status=200, tokenize_delay=0.0,
+                 tokenize_shape="count"):
     """(server, handler class). mode '409' refuses the token request before it is served.
 
     `caps` is the engine's /props chat_template_caps object; None leaves it out
@@ -221,13 +223,21 @@ def start_engine(material, mode="ok", case="answer", caps=None, n_ctx=None,
     `engine_version`/`contract` are the /props handshake (build.version, arcint.v).
     `token_mode` is what /props says (`ready` for token mode). `param` is the
     409 error.param (arcint.renderer_hash vs arcint.render.prompt_sha256).
-    `renderer_delay` sleeps before the renderer endpoint answers."""
+    `renderer_delay` sleeps before the renderer endpoint answers.
+    `tokenize_count` is POST /tokenize's answer: an int, a callable of the parsed
+    body, or None for 404 (an engine without the route). `tokenize_status` forces
+    an error status (404/500/...). `tokenize_shape` is "count" ({tokens,count})
+    or "tokens" (only {tokens}, the older content shape). `tokenize_delay` sleeps
+    before answering, for the timeout path. Hits and headers are recorded on the
+    handler class (`tokenize_hits`, `tokenize_auth`)."""
     class E(BaseHTTPRequestHandler):
         paths = []
         bodies = {}
         all_bodies = []
         prop_hits = 0
         renderer_hits = 0
+        tokenize_hits = 0
+        tokenize_auth = []
 
         def log_message(self, *args):
             pass
@@ -238,14 +248,20 @@ def start_engine(material, mode="ok", case="answer", caps=None, n_ctx=None,
             self.send_header("Content-Type", "application/json")
             self.send_header("Content-Length", str(len(raw)))
             self.end_headers()
-            self.wfile.write(raw)
+            try:
+                self.wfile.write(raw)
+            except (BrokenPipeError, ConnectionResetError):
+                pass   # der Client hat die Frist abgebrochen (Timeout-Test)
 
         def _sse(self, raw, status=200):
             self.send_response(status)
             self.send_header("Content-Type", "text/event-stream")
             self.send_header("X-Fixture", "engine")
             self.end_headers()
-            self.wfile.write(raw)
+            try:
+                self.wfile.write(raw)
+            except (BrokenPipeError, ConnectionResetError):
+                pass
 
         def do_GET(self):
             E.paths.append("GET " + self.path)
@@ -275,6 +291,28 @@ def start_engine(material, mode="ok", case="answer", caps=None, n_ctx=None,
             raw = self.rfile.read(int(self.headers.get("Content-Length", 0)))
             E.bodies[self.path] = raw
             E.all_bodies.append((self.path, raw))
+            if self.path == "/tokenize":
+                E.tokenize_hits += 1
+                E.tokenize_auth.append(self.headers.get("Authorization"))
+                if E.tokenize_delay:
+                    time.sleep(E.tokenize_delay)
+                if E.tokenize_status != 200:
+                    self._json({"error": "tokenize refused"}, E.tokenize_status)
+                    return
+                if E.tokenize_count is None:
+                    self._json({"error": "not found"}, 404)
+                    return
+                try:
+                    doc = json.loads(raw)
+                except ValueError:
+                    doc = None
+                n = (E.tokenize_count(doc) if callable(E.tokenize_count)
+                     else E.tokenize_count)
+                if E.tokenize_shape == "tokens":
+                    self._json({"tokens": [0] * int(n)})
+                else:
+                    self._json({"tokens": [0] * int(n), "count": int(n)})
+                return
             if self.path == "/v1/responses":
                 if E.mode == "409":
                     try:
@@ -305,6 +343,10 @@ def start_engine(material, mode="ok", case="answer", caps=None, n_ctx=None,
     E.token_mode = token_mode
     E.param = param
     E.renderer_delay = renderer_delay
+    E.tokenize_count = tokenize_count
+    E.tokenize_status = tokenize_status
+    E.tokenize_delay = tokenize_delay
+    E.tokenize_shape = tokenize_shape
     srv = ThreadingHTTPServer(("localhost", 0), E)
     threading.Thread(target=srv.serve_forever, daemon=True).start()
     return srv, E

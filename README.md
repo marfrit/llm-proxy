@@ -16,7 +16,7 @@ thinking across turns.
 |---|---|---|
 | engine (arcint) | 1.4.0 | [https://github.com/marfrit/arcint](https://github.com/marfrit/arcint/releases/tag/v1.4.0) |
 | renderer (feyntalk-render) | 1.0.0 | [https://github.com/marfrit/feyntalk-render](https://github.com/marfrit/feyntalk-render/releases/tag/v1.0.0) |
-| gateway (llm-proxy) | 1.3.0 | this repository |
+| gateway (llm-proxy) | 1.3.1 | this repository |
 
 The wiring guide for the whole chain is arcint's [`docs/feyntalk.md`](https://github.com/marfrit/arcint/blob/v1.4.0/docs/feyntalk.md). The runtime enforces these
 versions; see Version handshake.
@@ -250,13 +250,26 @@ without the capability is untouched). A client may override it: Chat
 compaction stage, once the preserved render would exceed
 `FEYNTALK_THINK_DROP_FRACTION` (default 0.7) of the engine's context length
 (`/props` `model.n_ctx`), the gateway renders again with `preserve_thinking:
-false` and sends that; the decision is taken on the preserved render's size, so it
-cannot flap and both caches stay warm. The size estimate is `len(prompt) /
-FEYNTALK_CHARS_PER_TOKEN` (default 3.0), because the `/props` probe carries no
-cheap token count. Without a known context length the gateway never drops and logs
-that once per material. Each token-mode request line carries
-`think=kept|dropped|off` (`off` when the capability is absent or thinking is
-disabled).
+false` and sends that; the decision is taken on the preserved render's size. The
+exact count is deterministic per prompt, and when `/tokenize` fails the estimate is
+scaled by the last observed exact/estimate ratio for that backend, so a decision
+once taken stays put and both caches stay warm. As long as the estimate stays below
+`FEYNTALK_TOKENIZE_PRE_FRACTION` (0.8) of the threshold, the size is
+`len(prompt) / FEYNTALK_CHARS_PER_TOKEN` (default 3.0), because the `/props` probe
+carries no cheap token count. Above that it would only take one overestimation to
+drop the thinking early, so the gateway asks the engine for the exact count of the
+preserved render (`POST /tokenize`, same Authorization as every engine route) and
+takes the decision on that number; if the route is absent, answers non-200 or runs
+into the timeout, the gateway falls back to the estimate scaled by the last observed
+exact/estimate ratio (the raw estimate if none was observed yet) and logs that once
+per backend -- the counter never fails a request. Without a known context length
+the gateway never drops and logs that once per material. Each token-mode request
+line carries `think=kept|dropped|off` (`off` when the capability is absent or
+thinking is disabled); an automatic decision also names where the number came from,
+`think=kept(exact)`, `think=kept(estimate)`, `think=dropped(exact)`,
+`think=kept(estimate, scaled)` or `think=dropped(estimate, scaled)`, and the
+one-time drop line writes `N tokens (exact)`, `~N tokens (estimate)` or
+`~N tokens (estimate, scaled)`.
 
 ### Version handshake
 

@@ -1,5 +1,22 @@
 # Changelog
 
+## 1.3.1 - unreleased
+
+- **Thinking replay, exact count.** Die Drop-Entscheidung der ersten Kompaktierungsstufe
+  fiel bisher nur auf der Zeichen-Schaetzung (`len(prompt) / FEYNTALK_CHARS_PER_TOKEN`, 3.0).
+  Gemessen (2026-11-01, Qwen3.8 Flash-Next, 131072 ctx) ueberschaetzte sie um ~1,5x und liess
+  das Denken bei real ~57-60 % Kontext fallen, was im naechsten Zug eine volle Neu-Vorberechnung
+  kostete. Liegt die Schaetzung nun bei mindestens `FEYNTALK_TOKENIZE_PRE_FRACTION` (0,8) der
+  Drop-Schwelle, fragt das Gateway die Engine exakt (`POST /tokenize` mit dem behaltenen Render;
+  dieselbe Authorization wie an die Engine-Routen) und entscheidet auf dieser Zahl. Fehlt die
+  Route, antwortet sie nicht 200 oder laeuft der Zaehler in die Frist, wird die Schaetzung mit
+  dem zuletzt beobachteten exact/Schaetzung-Verhaeltnis dieses Backends skaliert (ein float je
+  Backend, ohne Verhaeltnis die rohe Schaetzung), mit einer Logzeile je Backend -- der Zaehler
+  kippt nie eine Anfrage, und ein einzelner Fehlschlag kippt keine behaltene Entscheidung. Die
+  Logzeile nennt die Herkunft (`N tokens (exact)` bzw. `~N tokens (estimate)` / `~N tokens
+  (estimate, scaled)`), das `think=`-Feld traegt sie als `kept(exact)`/`kept(estimate)`/
+  `kept(estimate, scaled)`/`dropped(exact)`/`dropped(estimate)`/`dropped(estimate, scaled)`.
+
 ## 1.3.0 - 2026-11-01
 
 Part of the **feyntalk chain**, released and tested together with [arcint 1.4.0](https://github.com/marfrit/arcint/releases/tag/v1.4.0)
