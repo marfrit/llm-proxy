@@ -1,0 +1,5 @@
+{
+  "ds41-flash-light": {"model": "ds41-flash", "max_prompt_tokens": 262144},
+  "DeepSeek-v4.1-Flash-EXL3": {"model": "ds41-flash"},
+  "qwen3.6-coder-ft": {"model": "qwen3.6-coder", "feyntalk": "tokens"}
+}

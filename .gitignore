@@ -1,0 +1,10 @@
+__pycache__/
+*.pyc
+*.log
+*.bak
+*.bak-*
+# real config + runtime state (only *.example.json is committed)
+local-backends.json
+friendly-names.json
+cloud-catalog.json
+last-known-models.json

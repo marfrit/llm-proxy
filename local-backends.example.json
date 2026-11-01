@@ -1,0 +1,4 @@
+[
+  {"name": "local", "host": "127.0.0.1", "port": 8080, "slots": 1, "feyntalk": "off"},
+  {"name": "gpu-host", "host": "gpu-host.example.lan", "port": 8080, "slots": 4, "feyntalk": "off"}
+]
