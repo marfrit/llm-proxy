@@ -116,6 +116,14 @@ backend.
 
 Resolved requests are forwarded to the chosen backend and the response streamed back.
 
+Every incoming request carries an `X-Request-Id`: a client value that satisfies
+arcint's grammar (1–128 chars of `[A-Za-z0-9._:-]`) is kept, otherwise the gateway
+generates `req-` plus 16 lowercase hex. The id goes to every backend attempt of
+that request (failover included), comes back on every response the gateway sends
+(SSE included), and is on the per-request log line as `rid=<id>` — the same key
+arcint writes to its journal, so the two lines match by grep. A client value
+outside the grammar is never forwarded or logged.
+
 Upstream error statuses are passed through where they mean something: a 429 stays
 429 (with `Retry-After` when the upstream sends it), other 4xx stay 4xx, only
 network and 5xx errors become 502. Error logs carry request size, model and a short
@@ -225,7 +233,17 @@ any backend request goes out (`CLIENT-CANCELLED before send`).
   and translates the token/span events back into `reasoning_content`, `content`
   and real `tool_calls`. A tool call's name and arguments come from its span; the
   call id comes from the terminal `function_call` item. Streaming and non-stream
-  Chat requests are both served.
+  Chat requests are both served. A turn on which the engine reports its own
+  numbers — the context guard's arithmetic (`arcint:context`), the loop-guard
+  counters (`arcint:loop_guard`) and the fit pass's totals (`arcint:truncated`),
+  all from the engine's `terminal()` path — carries them on the last stream
+  frame and on the non-stream body as `arcint: {context: {...}, loop_guard:
+  {...}, truncated: {...}}` next to `usage`. Each key holds exactly the fields
+  the engine sent for that event, `type` dropped, nothing else: `token_index`
+  only when the guard closed, and a key is absent when its event was absent. A
+  turn without any of them adds no `arcint` object, so the shape stays
+  byte-identical; the text path is untouched, and `/v1/responses` keeps passing
+  the raw events through.
 - `/v1/responses` (and `/responses`): a token-mode request is augmented with the
   same render hashes and the engine's SSE is passed through unchanged, `arcint:`
   events included. Token mode there is stream-only.

@@ -69,7 +69,7 @@ import hashlib
 import math
 
 # Die eigene Version; geht in die Startzeile und in die Release-Notiz.
-__version__ = "1.3.1"
+__version__ = "1.3.2"
 
 # feyntalk: the optional renderer dependency. The proxy runs without it;
 # token mode is then unavailable and says so once (see _feyntalk_unavailable).
@@ -888,6 +888,27 @@ def _emit_log(msg):
 
 def log(msg):
     _emit_log(msg)
+
+
+# X-Request-Id: the arcint 1.4.2 grammar (1..128 chars of [A-Za-z0-9._:-]).
+# A client value outside it is never logged or forwarded; it is replaced by a
+# generated id in exactly the format the arcint server uses for its own.
+_RID_MUSTER = re.compile(r"[A-Za-z0-9._:-]{1,128}")
+
+
+def _rid_gueltig(wert):
+    return isinstance(wert, str) and bool(_RID_MUSTER.fullmatch(wert))
+
+
+def _rid_neu():
+    return "req-" + uuid.uuid4().hex[:16]
+
+
+def _anfrage_rid(wert):
+    """Die Anfrage-ID dieses Zuges: gueltiger Client-Wert oder neu erzeugt."""
+    if _rid_gueltig(wert):
+        return wert
+    return _rid_neu()
 
 
 def _anfrage_kurz(body, modell=""):
@@ -2626,6 +2647,42 @@ def _chat_finish_reason(resource, calls):
             "cancelled": "stop"}.get(reason, "stop")
 
 
+# Die Objekt-Ereignisse des engine-seitigen terminal()-Pfads, in der Reihenfolge,
+# in der die Engine sie schickt (src/api/responses_stream.cpp). Ihr Schluessel
+# im Chat-Objekt ist der Name hinter `arcint:`.
+_CHAT_ARCINT_KINDS = ("arcint:loop_guard", "arcint:context", "arcint:truncated")
+
+
+def _chat_arcint_fields(event):
+    """Die Felder eines Objekt-Ereignisses, ohne seinen Diskriminator.
+
+    Nur die Felder, die wirklich kamen: ein Zug ohne `token_index` bekommt
+    keinen, ein Zug ohne das Ereignis gar keinen Schluessel.
+    """
+    if not isinstance(event, dict):
+        return None
+    out = {k: v for k, v in event.items() if k != "type"}
+    return out or None
+
+
+def _chat_arcint_object(events):
+    """Das `arcint`-Objekt eines Chat-Terminals aus den gesammelten Ereignissen.
+
+    `events` ist Ereignisart -> rohes Ereignis. Die Engine schickt die drei
+    Objekt-Ereignisse einmal je Zug, nach den Spans und vor dem Terminal
+    (src/api/responses_stream.cpp, terminal()); ein Chat-Client liest sie als
+    `arcint: {context|loop_guard|truncated: {...}}` neben `usage`. Reihenfolge
+    und Inhalt folgen der Engine. Kein Ereignis: kein Objekt, damit der Rahmen
+    ohne Waechter byte-gleich bleibt.
+    """
+    out = {}
+    for kind in _CHAT_ARCINT_KINDS:
+        fields = _chat_arcint_fields(events.get(kind))
+        if fields:
+            out[kind.split(":", 1)[1]] = fields
+    return out or None
+
+
 def _chat_usage(resource):
     usage = resource.get("usage") if isinstance(resource, dict) else None
     if not isinstance(usage, dict):
@@ -3954,8 +4011,10 @@ def _drain_reader(resp, buf, on_full):
     """Eigener Faden: rohe SSE-Rahmen in den Puffer, Fehler in die Rueckgabeliste.
 
     Das Lesen darf nie am Schreiben oder Verarbeiten haengen. Faellt
-    read1 aus (Wachhund schliesst den Socket, fp ist None), landet die Ausnahme
-    in der Liste; der Konsument entscheidet, was sie bedeutet."""
+    read1 aus, landet die Ausnahme in der Liste; der Konsument entscheidet,
+    was sie bedeutet. Der Faden wird mit zurueckgegeben, damit der Aufrufer
+    ihn nach `buf.stop()` und dem Socket-shutdown beitreten kann: erst dann
+    darf die Verbindung geschlossen werden (siehe _stop_reader)."""
     errors = []
 
     def _run():
@@ -3971,11 +4030,82 @@ def _drain_reader(resp, buf, on_full):
         finally:
             buf.stop()
 
-    threading.Thread(target=_run, daemon=True).start()
-    return errors
+    t = threading.Thread(target=_run, daemon=True)
+    t.start()
+    return errors, t
+
+
+def _stop_reader(buf, sock, thread):
+    """Lesefaden beenden, bevor die Verbindung geschlossen wird.
+
+    Der Wachhund kappt den Backend-Socket mit shutdown(); danach bekommt der
+    Lesefaden ein sauberes EOF und sein read1 schliesst den fp. Schliesst
+    gleichzeitig ein conn.close() aus einem zweiten Faden, treffen sich beide
+    in `_close_conn`, der zweite liest `self.fp = None` und faellt an
+    `None.close` -- im Protokoll als `Lesefaden abgerissen: AttributeError:
+    'NoneType' object has no attribute 'close'`. Deshalb: Puffer wecken,
+    Socket kappen, dem Faden beitreten; erst danach schliesst der Hauptfaden
+    unter `_backend_close_lock` -- genau einmal.
+    """
+    buf.stop()
+    if sock is not None:
+        try:
+            sock.shutdown(socket.SHUT_RDWR)
+        except OSError:
+            pass
+    if thread is not None:
+        thread.join(timeout=0.5)    # shutdown weckt read1; die Frist ist nur Rueckfall
+
+
+def _lesefaden_abriss(err, gone_evt):
+    """Der Fehler des Lesefadens als Stromabriss, mit der richtigen Herkunft.
+
+    Ein AttributeError ist der bekannte Wettlauf, wenn der Wachhund den Socket
+    tatsaechlich gekappt hat (gone gesetzt). Ohne diesen Beweis ist es ein
+    echter Programmfehler: dann bleiben Typ und Meldung in der Logzeile, damit
+    er nicht als Client-Abbruch getarnt wird.
+    """
+    if isinstance(err, AttributeError) and gone_evt is not None and gone_evt.is_set():
+        return StromAbgeschnitten(
+            "die Backend-Verbindung wurde unter dem Lesefaden geschlossen")
+    return StromAbgeschnitten(f"Lesefaden abgerissen: {type(err).__name__}: {err}")
 
 
 class Handler(http.server.BaseHTTPRequestHandler):
+    def _rid_jetzt(self):
+        """Die ID dieses Zuges; fehlt sie noch, wird sie hier bestimmt.
+
+        Direkt aufgerufene Handlerteile (Tests, Einzelpfade) laufen ohne
+        _proxy, deshalb entsteht die ID auch hier -- nicht als Attributfehler."""
+        rid = getattr(self, "_rid", None)
+        if rid is None:
+            kopf = getattr(self, "headers", None)
+            wert = kopf.get("X-Request-Id") if kopf is not None else None
+            rid = self._rid = _anfrage_rid(wert)
+        return rid
+
+    def send_response(self, code, message=None):
+        # Jede Antwort traegt X-Request-Id: Erfolg, eigener Fehler, SSE vor
+        # dem ersten Ereignis (die Kopfzeilen gehen vor dem Strom raus).
+        rid = self._rid_jetzt()
+        super().send_response(code, message)
+        self.send_header("X-Request-Id", rid)
+
+    def _backend_rid_pruefen(self, resp, backend_name, method, path, hint):
+        """Der Backend-Wert weicht ab: das Gateway hat seinen geschickt, das
+        Backend hat ihn ersetzt. Einmal je Anfrage, der eigene Wert bleibt."""
+        try:
+            back = resp.getheader("X-Request-Id")
+        except Exception:
+            back = None
+        if getattr(self, "_rid_ersetzt_gemeldet", False):
+            return
+        eigene = self._rid_jetzt()
+        if _rid_gueltig(back) and back != eigene:
+            self._rid_ersetzt_gemeldet = True
+            log(f"{method} {path} -> {backend_name} "
+                f"backend_rid={back} (backend replaced the request id){hint}")
+
     def send_header(self, keyword, value):
         if keyword.lower() == "access-control-allow-origin":
             self._cors_gesetzt = True
@@ -3983,10 +4113,13 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
     def end_headers(self):
         # Eine erlaubte Browser-Anfrage darf die Antwort auch lesen: ohne ACAO
-        # blockt der Browser sie, obwohl der Preflight bestanden hat.
-        if getattr(self, "_cors_origin", None) and not getattr(self, "_cors_gesetzt", False):
-            self.send_header("Access-Control-Allow-Origin", self._cors_origin)
-            self.send_header("Vary", "Origin")
+        # blockt der Browser sie, obwohl der Preflight bestanden hat. Und ohne
+        # Expose-Headers kommt X-Request-Id im Browser nicht an.
+        if getattr(self, "_cors_origin", None):
+            if not getattr(self, "_cors_gesetzt", False):
+                self.send_header("Access-Control-Allow-Origin", self._cors_origin)
+                self.send_header("Vary", "Origin")
+            self.send_header("Access-Control-Expose-Headers", "X-Request-Id")
         super().end_headers()
 
     def _read_body(self):
@@ -3999,6 +4132,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             v = self.headers.get(k)
             if v:
                 h[k] = v
+        h["X-Request-Id"] = self._rid_jetzt()
         if body_len:
             h["Content-Length"] = str(body_len)
         return h
@@ -4011,6 +4145,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             "Accept-Encoding": "identity",
             "HTTP-Referer": os.environ.get("LLM_PROXY_REFERER", "http://localhost"),
             "X-Title": os.environ.get("LLM_PROXY_TITLE", "llm-proxy"),
+            "X-Request-Id": self._rid_jetzt(),
         }
         if body_len:
             h["Content-Length"] = str(body_len)
@@ -4046,7 +4181,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
         return buf, events
 
     def _stream_chat_from_tokens(self, resp, backend_name, t0, t_try, hint, method, path,
-                                 request, sock=None):
+                                 request, sock=None, gone_evt=None):
         material = request["material"]
         tools = request["tools"]
         model = request["model"]
@@ -4070,6 +4205,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
         emitted_reasoning = 0
         emitted_text = 0
         terminal = False
+        # Die Objekt-Ereignisse des engine-seitigen terminal()-Pfads
+        # (loop_guard, context, truncated), sofern der Zug welche schickte; sie
+        # reisen unveraendert als `arcint`-Objekt am Terminal mit.
+        arcint_events = {}
 
         # Der Upstream muss immer abgeflossen werden:
         # ein eigener Lesefaden schiebt die rohen SSE-Rahmen in einen
@@ -4084,7 +4223,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 f"Schreibpfad davon ({STREAM_QUEUE_MAX_BYTES // (1024 * 1024)} MiB "
                 f"gepuffert), Rueckstau - kein Token verworfen")
 
-        reader_error = _drain_reader(resp, buf, _reader_warn)
+        reader_error, reader_thread = _drain_reader(resp, buf, _reader_warn)
+        self._backend_reader = reader_thread
+        self._backend_buf = buf
 
         if client_stream:
             self.send_response(200)
@@ -4120,7 +4261,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self._client_flush()
 
         def _feed(chunk):
-            nonlocal sse_buf, rid, created, resource, terminal
+            nonlocal sse_buf, rid, created, resource, terminal, arcint_events
             sse_buf, events = self._events_from_buffer(sse_buf, chunk)
             for event in events:
                 if event is None:
@@ -4133,6 +4274,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     except _FTSpanError as e:
                         log(f"{method} {path} -> {backend_name} feyntalk: {e}")
                         raise StromAbgeschnitten("feyntalk span contract broken")
+                elif kind in _CHAT_ARCINT_KINDS:
+                    # Zahlen, kein Strom: kein Token, kein Span, nur das Objekt.
+                    arcint_events[kind] = event
                 elif kind in ("response.created", "response.in_progress"):
                     res = event.get("response")
                     if isinstance(res, dict):
@@ -4161,13 +4305,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                         err = reader_error[0]
                         if isinstance(err, TimeoutError):
                             raise err
-                        # Der Wachhund schliesst den Backend-Socket unter dem
-                        # Lesefaden weg (fp=None zwischen _get_chunk_left und
-                        # dem Lesen). Das ist kein Backend-Fehler, sondern
-                        # unser eigener Schnitt: ehrlich als Stromabriss
-                        # melden statt als Traceback.
-                        raise StromAbgeschnitten(
-                            f"Lesefaden abgerissen: {type(err).__name__}: {err}")
+                        raise _lesefaden_abriss(err, gone_evt)
                     break
                 _feed(chunk)
         except TimeoutError as e:
@@ -4177,7 +4315,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             raise StromAbgeschnitten(
                 f"feyntalk span contract broken after the headers were out: {e}")
         finally:
-            buf.stop()
+            _stop_reader(buf, sock, reader_thread)
 
         try:
             output = norm.finish()
@@ -4191,6 +4329,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
         output_items = resource.get("output") if isinstance(resource, dict) else None
         finish_reason = _chat_finish_reason(resource, calls)
         usage = _chat_usage(resource)
+        arcint = _chat_arcint_object(arcint_events)
         if not terminal:
             log(f"{method} {path} -> {backend_name} feyntalk: stream ended without a terminal event")
         if client_stream:
@@ -4199,6 +4338,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
             final = {"choices": [{"index": 0, "delta": {}, "finish_reason": finish_reason}]}
             if usage:
                 final["usage"] = usage
+            if arcint:
+                final["arcint"] = arcint
             self._client_write(("data: " + json.dumps(final, ensure_ascii=False) + "\n\n").encode("utf-8"))
             self._client_write(b"data: [DONE]\n\n")
             self._client_flush()
@@ -4223,6 +4364,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
                                  "finish_reason": finish_reason}]}
             if usage:
                 body["usage"] = usage
+            if arcint:
+                body["arcint"] = arcint
             raw = json.dumps(body, ensure_ascii=False).encode("utf-8")
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
@@ -4240,7 +4383,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             f"finish={finish_reason} think={request.get('think', 'off')}{hint}")
 
     def _stream_responses_from_tokens(self, resp, backend_name, t0, t_try, hint, method, path,
-                                      request, sock=None):
+                                      request, sock=None, gone_evt=None):
         if sock is not None:
             try:
                 sock.settimeout(READ_TIMEOUT)
@@ -4261,7 +4404,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 f"Schreibpfad davon ({STREAM_QUEUE_MAX_BYTES // (1024 * 1024)} MiB "
                 f"gepuffert), Rueckstau - kein Token verworfen")
 
-        reader_error = _drain_reader(resp, buf, _reader_warn)
+        reader_error, reader_thread = _drain_reader(resp, buf, _reader_warn)
+        self._backend_reader = reader_thread
+        self._backend_buf = buf
         # Der Responses-Passthrough ist immer ein Event-Strom.
         self._client_streaming = True
         self.send_response(resp.status)
@@ -4305,12 +4450,11 @@ class Handler(http.server.BaseHTTPRequestHandler):
                         if isinstance(err, TimeoutError):
                             raise BackendTimeout(
                                 f"kein Byte in {READ_TIMEOUT}s: {err}", True)
-                        raise StromAbgeschnitten(
-                            f"Lesefaden abgerissen: {type(err).__name__}: {err}")
+                        raise _lesefaden_abriss(err, gone_evt)
                     break
                 _relay(chunk)
         finally:
-            buf.stop()
+            _stop_reader(buf, sock, reader_thread)
         if norm is not None:
             try:
                 norm.finish()
@@ -4354,7 +4498,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 f"Schreibpfad davon ({STREAM_QUEUE_MAX_BYTES // (1024 * 1024)} MiB "
                 f"gepuffert), Rueckstau - kein Token verworfen")
 
-        reader_error = _drain_reader(resp, buf, _reader_warn)
+        reader_error, reader_thread = _drain_reader(resp, buf, _reader_warn)
+        self._backend_reader = reader_thread
+        self._backend_buf = buf
         t_hdr = time.monotonic()
         self.send_response(resp.status)
         content_type = resp.getheader("Content-Type", "").lower()
@@ -4464,7 +4610,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             abgeschnitten = StromAbgeschnitten(
                 f"{bytes_out} Bytes gingen raus, dann war die Verbindung zu")
         finally:
-            buf.stop()
+            _stop_reader(buf, sock, reader_thread)
         if seam is not None:
             # Was die Naht-Erkennung noch zurueckhaelt, darf nicht verschluckt werden.
             try:
@@ -4539,6 +4685,29 @@ class Handler(http.server.BaseHTTPRequestHandler):
             except (OSError, ValueError) as e:
                 raise ClientGone(f"Schreibfehler an den Anrufer: {type(e).__name__}: {e}") from e
 
+    def _close_backend(self, conn):
+        """Backend-Verbindung genau einmal schliessen, serialisiert.
+
+        Der Wachhund und der Hauptfaden koennen beide hier ankommen (Auflegen
+        waehrend eines laufenden Stroms). Ohne Sperre schliessen zwei Faden
+        denselben HTTPResponse; der zweite `_close_conn` faellt an
+        `None.close`. Cloud-/Zen-Verbindungen haben keine solche Sperre -- dort
+        schliesst nur ein Faden, der Aufruf bleibt der direkte close()."""
+        if conn is None:
+            return
+        lock = getattr(self, "_backend_close_lock", None)
+        if lock is None:
+            try:
+                conn.close()
+            except Exception:
+                pass
+            return
+        with lock:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
     def flush_headers(self):
         """Kopfzeilen ueber den Client-Schreibweg: ein Fehler dort ist
         ClientGone (CLIENT-CANCELLED), kein Backend-FAIL."""
@@ -4593,14 +4762,22 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     # bei einer kalten Vorfuellung Minuten, in denen das Backend fuer
                     # niemanden rechnet. shutdown() reisst den blockierten Aufruf
                     # sofort (gemessen 2026-09-22: 5 s+ haengend -> 0,0 s).
+                    # Danach dem Lesefaden beitreten: erst dann darf geschlossen
+                    # werden, sonst treffen zwei `_close_conn` aufeinander und
+                    # der zweite faellt an `None.close`.
                     try:
                         sk = getattr(c, "sock", None)
                         if sk is not None:
                             sk.shutdown(socket.SHUT_RDWR)
                     except OSError:
                         pass
-                    try: c.close()
-                    except Exception: pass
+                    buf = getattr(self, "_backend_buf", None)
+                    if buf is not None:
+                        buf.stop()          # weckt einen in put parkenden Leser
+                    t = getattr(self, "_backend_reader", None)
+                    if t is not None and t is not threading.current_thread():
+                        t.join(timeout=CONNECT_TIMEOUT)
+                    self._close_backend(c)    # unter der Sperre, genau einmal
                     return
                 time.sleep(0.1)
 
@@ -4664,7 +4841,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
         name, host, port = backend
         slot = _admit(name)
         if not slot:
-            log(f"{method} {path} -> {name} BUSY (admission gate, slots={_backend_slots.get(name)}) total={time.monotonic()-t0:.2f}s")
+            log(f"{method} {path} -> {name} BUSY (admission gate, slots={_backend_slots.get(name)}) total={time.monotonic()-t0:.2f}s{hint}")
             return "busy"
         t_try = time.monotonic()
         conn = None
@@ -4677,6 +4854,12 @@ class Handler(http.server.BaseHTTPRequestHandler):
         self._client_lock = threading.Lock()
         self._client_wrote = threading.Event()
         self._client_streaming = is_streaming
+        # Der Lesefaden dieses Versuchs und die Sperre um den Verbindungsschluss:
+        # der Wachhund wartet auf den Faden, bevor er schliesst, und beide
+        # Schluesse (Wachhund, Hauptfaden) laufen unter derselben Sperre.
+        self._backend_reader = None
+        self._backend_buf = None
+        self._backend_close_lock = threading.Lock()
         self._client_watchdog(lambda: conn, gone, stop)   # frees the slot if the client bails
         # Sendezeitsperre auch auf dem Token-Pfad: ein Client, der halb
         # schliesst und dann nicht mehr liest, blockiert den Schreibvorgang;
@@ -4721,6 +4904,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 # bereits: gone.is_set() -> "aborted", sonst "down".
                 raise ConnectionResetError(
                     "Backend-Verbindung waehrend getresponse() geschlossen")
+            self._backend_rid_pruefen(resp, name, method, path, hint)
             if token_request and resp.status == 409:
                 # The engine refused before any token and before the slot was
                 # used for generation: re-send the same turn once as a text
@@ -4738,10 +4922,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     wort = "prompt mismatch" if kind == "prompt" else "renderer mismatch"
                     log(f"{method} {path} -> {name} feyntalk 409 {wort}; "
                         f"keeping capability cache, retrying this turn once in text mode")
-                try:
-                    conn.close()
-                except Exception:
-                    pass
+                self._close_backend(conn)
                 conn = http.client.HTTPConnection(host, port,
                                                   timeout=CONNECT_TIMEOUT if not is_last else READ_TIMEOUT)
                 retry = token_request.get("retry_body") if token_request else None
@@ -4755,28 +4936,25 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 if resp is None:
                     raise ConnectionResetError(
                         "Backend-Verbindung waehrend getresponse() geschlossen")
+                self._backend_rid_pruefen(resp, name, method, path, hint)
                 token_request = None
             if token_request:
                 if token_request["kind"] == "chat":
                     self._stream_chat_from_tokens(resp, name, t0, t_try, hint, method, path,
-                                                  token_request, sock=backend_sock)
+                                                  token_request, sock=backend_sock, gone_evt=gone)
                 else:
                     self._stream_responses_from_tokens(resp, name, t0, t_try, hint, method, path,
-                                                       token_request, sock=backend_sock)
+                                                       token_request, sock=backend_sock, gone_evt=gone)
             else:
                 self._stream_response(resp, name, t0, t_try, hint, method, path, is_streaming=is_streaming, gone_evt=gone,
                                       salvage_tools=getattr(self, "_req_tools", None),
                                       chatml_guard=getattr(self, "_chatml_guard", False), sock=backend_sock)
-            conn.close()
+            self._close_backend(conn)
             return "ok"
         except _FeyntalkBadRequest as e:
             # Ungueltiges preserve_thinking des Anrufers: 400, nicht an das
             # Backend weiterleiten und nicht in den Textmode fallen.
-            try:
-                if conn:
-                    conn.close()
-            except Exception:
-                pass
+            self._close_backend(conn)
             self._feyntalk_bad_request = str(e)
             log(f"{method} {path} -> {name} 400 {e}")
             return "badrequest"
@@ -4784,22 +4962,14 @@ class Handler(http.server.BaseHTTPRequestHandler):
             # Der Schreibvorgang an den Anrufer ist gescheitert: der Anrufer
             # ist weg, nicht das Backend. Kein Weiterreichen an ein anderes
             # Backend (die Kopfzeilen sind schon raus) und keine FAIL-Zeile.
-            try:
-                if conn:
-                    conn.close()
-            except Exception:
-                pass
+            self._close_backend(conn)
             weg = getattr(gone, "at", None)
             wann = f"Anrufer weg nach {weg - t_try:.2f}s, " if weg else ""
             log(f"{method} {path} -> {name} CLIENT-CANCELLED, {wann}backend cut loose, "
                 f"slot freed after {time.monotonic()-t_try:.2f}s ({e})")
             return "aborted"
         except BackendTimeout as e:
-            try:
-                if conn:
-                    conn.close()
-            except Exception:
-                pass
+            self._close_backend(conn)
             if gone.is_set():   # der Anrufer hat aufgelegt, nicht das Backend
                 weg = getattr(gone, "at", None)
                 wann = f"Anrufer weg nach {weg - t_try:.2f}s, " if weg else ""
@@ -4813,11 +4983,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             # Muss vor der allgemeinen Klausel stehen: ConnectionResetError ist
             # ein OSError. Die Kopfzeilen sind beim Anrufer, also kein
             # Weiterreichen und kein Fehlerrumpf - nur eine ehrliche Zeile.
-            try:
-                if conn:
-                    conn.close()
-            except Exception:
-                pass
+            self._close_backend(conn)
             grund = "CLIENT-CANCELLED" if gone.is_set() else "STREAM-CUT"
             weg = getattr(gone, "at", None)
             wann = f"Anrufer weg nach {weg - t_try:.2f}s, " if weg else ""
@@ -4825,11 +4991,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 f"{time.monotonic()-t_try:.2f}s ({e}){hint}")
             return "aborted"
         except (ConnectionRefusedError, TimeoutError, OSError, http.client.HTTPException, ValueError) as e:
-            try:
-                if conn:
-                    conn.close()
-            except Exception:
-                pass
+            self._close_backend(conn)
             if gone.is_set():   # the watchdog closed conn: client cancelled, not a backend fault
                 weg = getattr(gone, "at", None)
                 wann = f"Anrufer weg nach {weg - t_try:.2f}s, " if weg else ""
@@ -4899,7 +5061,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                         "available": sorted(available),
                     }}).encode()
                     self._send_error(503, payload)
-                    log(f"{method} {path} -> model={model!r} 503 (backend down: {','.join(stumm)}) total={time.monotonic()-t0:.2f}s")
+                    log(f"{method} {path} -> model={model!r} 503 (backend down: {','.join(stumm)}) total={time.monotonic()-t0:.2f}s{hint}")
                     return
                 payload = json.dumps({"error": {
                     "message": f"model '{model}' not available on any local backend",
@@ -4907,7 +5069,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     "available": sorted(available),
                 }}).encode()
                 self._send_error(404, payload)
-                log(f"{method} {path} -> model={model!r} 404 (not in any local backend) total={time.monotonic()-t0:.2f}s")
+                log(f"{method} {path} -> model={model!r} 404 (not in any local backend) total={time.monotonic()-t0:.2f}s{hint}")
                 return
         if chosen is not None:
             r = self._try_backend(chosen, method, path, body, fwd, t0, hint + " (routed)", is_last=True, is_streaming=is_streaming, feyntalk=feyntalk)
@@ -4931,7 +5093,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             geeignet = [b for b in backends
                         if b is not chosen and model in (discover(b) or [])]
             if not geeignet:
-                log(f"{method} {path} -> {chosen[0]} routed-FAIL, kein anderes Backend fuehrt {model!r} total={time.monotonic()-t0:.2f}s")
+                log(f"{method} {path} -> {chosen[0]} routed-FAIL, kein anderes Backend fuehrt {model!r} total={time.monotonic()-t0:.2f}s{hint}")
                 self._send_error(502, json.dumps({"error": {
                     "message": (f"backend '{chosen[0]}' serving model "
                                 f"'{model}' is unavailable, and no other local "
@@ -4940,7 +5102,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     "model": model,
                 }}).encode())
                 return
-            log(f"{method} {path} -> {chosen[0]} routed-FAIL, weiter an {[b[0] for b in geeignet]}")
+            log(f"{method} {path} -> {chosen[0]} routed-FAIL, weiter an {[b[0] for b in geeignet]}{hint}")
             chain = geeignet
         else:
             chain = [b for b in backends if b is not chosen]
@@ -4962,10 +5124,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 busy_seen = True
         if busy_seen:
             self._send_error(503, b'{"error":{"message":"all local backends busy (admission gate), retry shortly","type":"backend_busy"}}')
-            log(f"{method} {path} -> ALL_BUSY total={time.monotonic()-t0:.2f}s")
+            log(f"{method} {path} -> ALL_BUSY total={time.monotonic()-t0:.2f}s{hint}")
         else:
             self._send_error(502, b'{"error":"all local backends down"}')
-            log(f"{method} {path} -> ALL_DOWN total={time.monotonic()-t0:.2f}s")
+            log(f"{method} {path} -> ALL_DOWN total={time.monotonic()-t0:.2f}s{hint}")
 
     def _proxy_zen(self, method, path, body, hint, t0, is_streaming=False):
         upstream_path = "/zen/v1/chat/completions"
@@ -4991,6 +5153,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             "Content-Type": "application/json",
             "Accept": "application/json",
             "Accept-Encoding": "identity",
+            "X-Request-Id": self._rid_jetzt(),
         }
         t_try = time.monotonic()
         conn = None
@@ -5002,6 +5165,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             )
             conn.request(method, upstream_path, body=body, headers=fwd)
             resp = conn.getresponse()
+            self._backend_rid_pruefen(resp, "opencode-zen", method, path, hint)
             if resp.status >= 400:
                 resp_body = resp.read()
                 # Der Anbieterstatus ist eine Aussage: 429 bleibt 429 (mit
@@ -5015,20 +5179,16 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 self._send_error(status, resp_body, headers=kopf)
                 log(f"{method} {path} -> opencode-zen status={resp.status} "
                     f"{_anfrage_kurz(body, modell)} ttfb={time.monotonic()-t_try:.2f}s")
-                conn.close()
+                self._close_backend(conn)
                 return
             self._stream_response(resp, "opencode-zen", t0, t_try, hint, method, path, is_streaming=is_streaming)
-            conn.close()
+            self._close_backend(conn)
         except Exception as e:
             err = json.dumps({"error": f"opencode-zen: {type(e).__name__}: {e}"}).encode()
             self._send_error(502, err)
             log(f"{method} {path} -> opencode-zen FAIL {type(e).__name__}: {e} "
                 f"{_anfrage_kurz(body, modell)}")
-            try:
-                if conn:
-                    conn.close()
-            except Exception:
-                pass
+            self._close_backend(conn)
 
     def _proxy_cloud(self, method, path, body, hint, t0, is_streaming=False):
         if not OR_KEY:
@@ -5047,17 +5207,14 @@ class Handler(http.server.BaseHTTPRequestHandler):
             )
             conn.request(method, upstream_path, body=body, headers=fwd)
             resp = conn.getresponse()
+            self._backend_rid_pruefen(resp, "openrouter", method, path, hint)
             self._stream_response(resp, "openrouter", t0, t_try, hint, method, path, is_streaming=is_streaming)
-            conn.close()
+            self._close_backend(conn)
         except Exception as e:
             err = json.dumps({"error": f"openrouter: {type(e).__name__}: {e}"}).encode()
             self._send_error(502, err)
-            log(f"{method} {path} -> openrouter FAIL {type(e).__name__}: {e}")
-            try:
-                if conn:
-                    conn.close()
-            except Exception:
-                pass
+            log(f"{method} {path} -> openrouter FAIL {type(e).__name__}: {e}{hint}")
+            self._close_backend(conn)
 
     def _handle_models(self, t0):
         mode = _aktiver_modus()
@@ -5176,6 +5333,11 @@ class Handler(http.server.BaseHTTPRequestHandler):
     def _proxy(self, method):
         t0 = time.monotonic()
         path = self.path
+        # Eine ID je Anfrage: gueltiger Client-Wert, sonst neu erzeugt. Sie
+        # reist an jeden Upstream-Versuch, steht in Antwort und Logzeile.
+        self._rid = _anfrage_rid(self.headers.get("X-Request-Id"))
+        self._rid_ersetzt_gemeldet = False
+        hint = f" rid={self._rid}"
         try:
             self._cors_origin = None
             self._cors_gesetzt = False
@@ -5185,7 +5347,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     self._send_error(403, json.dumps({"error": {
                         "type": "origin_not_allowed",
                         "message": f"Origin '{origin}' ist nicht erlaubt"}}).encode())
-                    log(f"{method} {path} -> 403 Origin nicht erlaubt ({origin})")
+                    log(f"{method} {path} -> 403 Origin nicht erlaubt ({origin}){hint}")
                     return
                 self._cors_origin = origin
 
@@ -5238,13 +5400,12 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     self._send_error(415, json.dumps({"error": {
                         "type": "unsupported_media_type",
                         "message": "POST-Rumpf muss application/json sein"}}).encode())
-                    log(f"{method} {path} -> 415 Content-Type {typ or '(fehlt)'}")
+                    log(f"{method} {path} -> 415 Content-Type {typ or '(fehlt)'}{hint}")
                     return
             self._req_tools = None   # je Anfrage neu: keep-alive benutzt den Handler weiter
             self._req_parallel = True
             self._chatml_guard = False
             self._req_seam = False   # nur lokale Denkmodelle bekommen den Seam
-            hint = ""
             model = ""
             alias = None
             stream = False
@@ -5283,7 +5444,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                                 f"Backend noch im Wolkenkatalog bekannt"),
                             "available": sorted(verfuegbar),
                         }}).encode()
-                        log(f"UNBEKANNT: {raw_model} - 404 model_not_found")
+                        log(f"UNBEKANNT: {raw_model} - 404 model_not_found{hint}")
                         self.send_response(404)
                         self.send_header("Content-Type", "application/json")
                         self.send_header("Content-Length", str(len(msg)))
@@ -5293,7 +5454,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
                     blocked, why = _policy_blocked(raw_model, model, kind)
                     if blocked:
-                        log(f"BLOCKED (Kostenregler): {raw_model} - {why}")
+                        log(f"BLOCKED (Kostenregler): {raw_model} - {why}{hint}")
                         msg = json.dumps({"error": {
                             "type": "policy_blocked",
                             "message": (
@@ -5334,7 +5495,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     max_t = j.get("max_tokens") or j.get("max_completion_tokens") or "-"
                     total_chars = sum(len(str(m.get("content", ""))) for m in j.get("messages", []))
                     stream = j.get("stream", False)
-                    hint = f" model={model} msgs={n_msgs} in_chars={total_chars} max_tok={max_t} stream={stream}"
+                    hint += f" model={model} msgs={n_msgs} in_chars={total_chars} max_tok={max_t} stream={stream}"
                     # reasoning passthrough: ask reasoning-capable local models to split
                     # their thinking into a separate `reasoning` stream (chat-template kwarg),
                     # so clients can surface it. The byte-relay forwards the field untouched.
@@ -5450,7 +5611,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                         "type": "rate_limited",
                     }}).encode()
                     self._send_error(429, payload)
-                    log(f"{method} {path} -> model={model!r} 429 (na) total={time.monotonic()-t0:.2f}s")
+                    log(f"{method} {path} -> model={model!r} 429 (na) total={time.monotonic()-t0:.2f}s{hint}")
                     return
                 self._proxy_cloud(method, path, body, hint, t0, is_streaming=stream)
             else:
@@ -5468,6 +5629,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
     def do_POST(self): self._proxy("POST")
     def do_GET(self): self._proxy("GET")
     def do_OPTIONS(self):
+        self._rid = _anfrage_rid(self.headers.get("X-Request-Id"))
+        self._rid_ersetzt_gemeldet = False
         self._cors_gesetzt = False
         origin = self.headers.get("Origin")
         self._cors_origin = origin if origin and _origin_allowed(origin) else None
@@ -5476,7 +5639,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self.send_header("Access-Control-Allow-Origin", self._cors_origin)
             self.send_header("Vary", "Origin")
             self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
-            self.send_header("Access-Control-Allow-Headers", "Content-Type, Authorization")
+            self.send_header("Access-Control-Allow-Headers",
+                             "Content-Type, Authorization, X-Request-Id")
         self.end_headers()
 
     def log_message(self, fmt, *args): pass

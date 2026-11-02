@@ -1,5 +1,58 @@
 # Changelog
 
+## 1.3.2 - 2026-11-02
+
+- **Kontext-Waechter am Chat-Rand.** Die Engine meldet mit `arcint:context`
+  einmal je Zug die Arithmetik ihres Kontext-Waechters (`used`, `n_ctx`,
+  `remaining`, `forced_close`, bei geschlossenem Waechter `token_index`), sofern
+  die Anfrage den Waechter konfiguriert. Der Responses-Passthrough reichte das
+  Ereignis schon roh weiter; der Token-Modus-Chat verschluckte es, weil er seine
+  Rahmen aus dem normalisierten Strom baut und nur `arcint:token`/`arcint:span`
+  einspeist. Jetzt traegt der letzte Rahmen eines Chat-Stroms und der Rumpf
+  einer Nicht-Stream-Antwort den Objekt-Schluessel `arcint: {context: {...}}`
+  neben `usage` -- mit genau den Feldern, die die Engine geschickt hat, ohne den
+  Ereignis-Diskriminator `type`. Ein Zug ohne das Ereignis bekommt keinen
+  `arcint`-Schluessel; `usage` und `finish_reason` bleiben, wo sie waren. Der
+  Text-Modus ist unveraendert.
+
+- **Client-Abbruch mitten im Strom ohne Lesefaden-Fehler.** Der Client-Wachhund
+  kappt den Backend-Socket mit `shutdown()`; der Lesefaden bekam dabei ein EOF
+  und schloss in `read1` denselben `HTTPResponse`, waehrend der Wachhund danach
+  die Verbindung schloss. Beide `_close_conn` trafen sich, der zweite las
+  `self.fp = None` und fiel an `AttributeError: 'NoneType' object has no attribute
+  'close'` -- im Protokoll als `Lesefaden abgerissen: ...`, obwohl der Abbruch
+  selbst funktionierte. Jetzt wartet der Wachhund
+  auf den Lesefaden und schliesst unter einer Sperre; der Hauptfaden schliesst
+  nach dem Beitritt unter derselben Sperre. Das Backend sieht den Abbruch
+  weiterhin per `shutdown()`, die Verbindung wird genau einmal geschlossen, und
+  die Zeile entfaellt.
+
+- **Auch die anderen Objekt-Ereignisse am Chat-Rand.** Aus demselben
+  `terminal()`-Pfad der Engine kommen zwei weitere Zahlen-Objekte, die der
+  Token-Modus-Chat bisher stumm fallen liess: `arcint:loop_guard` (die neun
+  Zaehler: `detections`, `nudges`, `slaps`, `aborts`, `self_closes`,
+  `door_masked`, `door_eog_masked`, `context_closes`, `context_no_closer`) und
+  `arcint:truncated` (die Fit-Pass-Zahlen: `blocks_dropped`, `tokens_freed`,
+  `prompt_tokens_before`, `prompt_tokens_after`, `reserve`). Beide reisen jetzt
+  im selben `arcint`-Objekt neben `usage`, unter `loop_guard` und `truncated`,
+  mit genau den Feldern, die die Engine schickte -- je Ereignis ein Schluessel,
+  fehlt das Ereignis, fehlt der Schluessel. Ein Zug ohne Objekt-Ereignis bleibt
+  byte-gleich; Text-Modus und Responses-Passthrough unveraendert.
+
+- **X-Request-Id, die Client-Seite von arcint 1.4.2.** Jede eingehende Anfrage
+  bekommt eine ID: ein Client-Wert, der arcints Grammatik erfuellt (1..128
+  Zeichen aus `[A-Za-z0-9._:-]`), bleibt; sonst erzeugt das Gateway eine im
+  selben Format (`req-` + 16 Hex, zufaellig). Die ID reist an jeden
+  Upstream-Versuch des Zuges -- auch beim Weiterreichen an ein anderes Backend
+  bleibt sie dieselbe -- und kommt auf jeder Antwort des Gateways zurueck
+  (Erfolg, eigener Fehler, SSE schon in den Kopfzeilen vor dem ersten
+  Ereignis). Ein ungueltiger Client-Wert wird nie weitergereicht oder
+  protokolliert. Antwortet ein Backend mit einer anderen gueltigen ID, gewinnt
+  die Gateway-ID; die Abweichung steht einmal im Protokoll
+  (`rid=<uns> backend_rid=<seins> (backend replaced the request id)`). Die
+  per-Request-Logzeile traegt ` rid=<id>` neben Modell, Backend, Groessen und
+  Zeiten, sodass sie sich mit der arcint-Journalzeile per grep paaren laesst.
+
 ## 1.3.1 - unreleased
 
 - **Thinking replay, exact count.** Die Drop-Entscheidung der ersten Kompaktierungsstufe

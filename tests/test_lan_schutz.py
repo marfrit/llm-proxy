@@ -84,6 +84,30 @@ code, h, _ = anfrage("OPTIONS", "/v1/chat/completions",
                      None, {"Origin": "http://erlaubt.example"})
 check(h.get("Access-Control-Allow-Origin") == "http://erlaubt.example",
       f"OPTIONS spiegelt erlaubtes Origin nicht: {h.get('Access-Control-Allow-Origin')!r}")
+erlaubt = h.get("Access-Control-Allow-Headers") or ""
+check("X-Request-Id" in erlaubt,
+      f"Preflight erlaubt X-Request-Id nicht: {erlaubt!r}")
+
+# 4b) CORS-Antworten geben X-Request-Id zum Lesen frei, GET und POST.
+code, h, _ = anfrage("GET", "/health", None,
+                     {"Origin": "http://erlaubt.example"})
+check(code == 200, f"CORS-GET /health: {code}")
+expose = h.get("Access-Control-Expose-Headers") or ""
+check("X-Request-Id" in expose,
+      f"CORS-GET gibt X-Request-Id nicht frei: {expose!r}")
+check(h.get("Access-Control-Allow-Origin") == "http://erlaubt.example",
+      "CORS-GET ohne ACAO")
+code, h, _ = anfrage("POST", "/v1/chat/completions",
+                     json.dumps({"messages": []}).encode(),
+                     {"Content-Type": "application/json",
+                      "Origin": "http://erlaubt.example"})
+check(h.get("Access-Control-Allow-Origin") == "http://erlaubt.example",
+      "CORS-POST ohne ACAO")
+expose = h.get("Access-Control-Expose-Headers") or ""
+check("X-Request-Id" in expose,
+      f"CORS-POST gibt X-Request-Id nicht frei: {expose!r}")
+check("X-Request-Id" in h,
+      "CORS-POST-Antwort traegt keine X-Request-Id")
 
 # 5) /admin/recheck zweimal im Fenster -> zweiter Aufruf 429
 code1, _, _ = anfrage("POST", "/admin/recheck", b"")
