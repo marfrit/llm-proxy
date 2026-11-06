@@ -342,6 +342,18 @@ check(E.paths.count("POST /v1/responses") == 2 and "POST /v1/chat/completions" n
 check(lp.FEYNTALK_COUNTS["eng"] == {"tokens": 1, "fallbacks": 0, "errors": 0}, f"Zaehler: {lp.FEYNTALK_COUNTS['eng']}")
 px.close(); srv.shutdown()
 
+# 17b) -ft ohne Strom ueber _proxy: der Proxy haengt seine Stop-Strings nicht an; die des Anrufers scheitern
+srv, E, px = real(QWEN38_STYLE)
+status, path, data = px.post(dict(BODY, model="m-ft", stream=False, reasoning_effort="low"))
+check(status == 200 and path == "tokens", f"-ft ohne Strom: {status} {path} {data[:100]!r}")
+status, path, data = px.post(dict(BODY, model="m-ft", stream=False, stop=["x"]))
+check(status == 400 and b"token_mode_unsupported_request" in data, f"-ft mit stop: {status} {data[:100]!r}")
+px.close(); srv.shutdown()
+srv, E, px = real(QWEN38_STYLE, setting="text")
+status, path, data = px.post(dict(BODY, stream=False))
+check(status == 200 and "stop" in json.loads(E.bodies["/v1/chat/completions"]), "Textpfad ohne Strom verlor die Stop-Strings")
+px.close(); srv.shutdown()
+
 # 18) Keep-Alive: eine spaetere Anfrage auf demselben Handler traegt keinen alten Pfad
 a, b = socket.socketpair()
 h = H(io.BytesIO(), a)

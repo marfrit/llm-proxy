@@ -69,7 +69,7 @@ import hashlib
 import math
 
 # Die eigene Version; geht in die Startzeile und in die Release-Notiz.
-__version__ = "1.3.3"
+__version__ = "1.3.4"
 
 # feyntalk: the optional renderer dependency. The proxy runs without it;
 # token mode is then unavailable and says so once (see _feyntalk_unavailable).
@@ -5683,7 +5683,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     # (2026-10-18). Stroeme bekommt ChatMLGuard, der nur den Antworttext prueft.
                     if _is_local_model(model) and stream:
                         self._chatml_guard = True
-                    elif _is_local_model(model):
+                    elif _is_local_model(model) and not (alias and alias.get("feyntalk") == "tokens"):
+                        # Not on a token alias: it has no text path, and token mode refuses stop
+                        # strings, so these would fail every non-stream request there.
                         st = j.get("stop")
                         if st is None:
                             st = []

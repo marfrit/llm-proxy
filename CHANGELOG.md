@@ -1,5 +1,12 @@
 # Changelog
 
+## 1.3.4 - 2026-11-06
+
+- **`-ft` ohne Strom.** Der Proxy haengt nicht-gestreamten lokalen Anfragen ChatML-Stop-Strings an, und der
+  Token-Modus lehnt Stop-Strings ab. Seit 1.3.3 scheiterte darum jede Nicht-Stream-Anfrage auf einem `-ft`-Alias mit
+  `400 token_mode_unsupported_request`; davor hatte der stille Text-Rueckfall das verdeckt. Ein Token-Alias bekommt die
+  Stop-Strings nicht mehr. Stop-Strings des Anrufers bleiben dort ein `400`.
+
 ## 1.3.3 - 2026-11-06
 
 - **Effort im Render.** `_feyntalk_render` gab nur `enable_thinking` an die Vorlage,
