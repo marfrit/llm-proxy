@@ -69,7 +69,7 @@ import hashlib
 import math
 
 # Die eigene Version; geht in die Startzeile und in die Release-Notiz.
-__version__ = "1.3.2"
+__version__ = "1.3.3"
 
 # feyntalk: the optional renderer dependency. The proxy runs without it;
 # token mode is then unavailable and says so once (see _feyntalk_unavailable).
@@ -1450,6 +1450,26 @@ class _FeyntalkRefusal(Exception):
     """This request cannot be rendered for token mode; fall back to text."""
 
 
+class _FeyntalkStrict(Exception):
+    """A `-ft` name can't run token mode: fail the request instead of the text path.
+    Operator decision: failures must show."""
+
+    def __init__(self, status, code, message):
+        super().__init__(message)
+        self.status, self.code, self.message = status, code, message
+
+
+# Per backend: token turns served, turns that fell back to text, `-ft` turns failed.
+FEYNTALK_COUNTS = {}
+_FEYNTALK_COUNTS_LOCK = threading.Lock()
+
+
+def _feyntalk_count(name, what):
+    with _FEYNTALK_COUNTS_LOCK:
+        c = FEYNTALK_COUNTS.setdefault(name, {"tokens": 0, "fallbacks": 0, "errors": 0})
+        c[what] += 1
+
+
 class _FeyntalkBadRequest(Exception):
     """Ein preserve_thinking des Anrufers ist kein bool: 400, nicht weiterleiten."""
 
@@ -2312,36 +2332,72 @@ def _tool_choice_to_responses(choice):
 def _feyntalk_enable(model, body, chat):
     """Enable-thinking for the render, and the field that carries it upstream.
 
-    Chat: reasoning_effort (mapped per model, like the proxy's own pass-through),
-    else chat_template_kwargs.enable_thinking, else the local reasoning capability
+    Chat: reasoning_effort, with chat_template_kwargs.enable_thinking as the switch
+    over it; else that switch alone, else the local reasoning capability
     the proxy already applies to Chat requests. Responses: reasoning.effort only.
     """
     if chat:
         kwargs = body.get("chat_template_kwargs")
         kw = kwargs.get("enable_thinking") if isinstance(kwargs, dict) else None
-        if isinstance(kw, bool):
-            return kw, ("medium" if kw else "none")
+        # _proxy has already applied the per-model effort map and may have added
+        # enable_thinking itself, so the level has to be read before the switch: the
+        # switch only says on or off. As in the engine, an explicit switch wins.
         effort = body.get("reasoning_effort")
         if isinstance(effort, str):
-            hit, new = _map_reasoning_effort(model, effort)
-            if hit and new is None:
+            off = effort in ("none", "off")
+            if kw is False or (off and kw is not True):
+                return False, "none"
+            if off:
+                # Switch on, level off: name neither, so both renders leave the choice to
+                # the template's own default.
                 return None, None
-            effort = new if hit else effort
-            return effort != "none", effort
+            return True, effort
+        if isinstance(kw, bool):
+            return kw, ("medium" if kw else "none")
         if _local_reasoning(model):
             return True, "medium"
         return None, None
     reasoning = body.get("reasoning")
     if isinstance(reasoning, dict) and isinstance(reasoning.get("effort"), str):
         effort = reasoning["effort"]
-        return effort != "none", effort
+        if effort in ("none", "off"):
+            return False, "none"
+        return True, effort
     return None, None
 
 
-def _feyntalk_render(cap, messages, tools, enable, preserve=None):
+def _template_quotes(src, token):
+    return f"'{token}'" in src or f'"{token}"' in src
+
+
+def _feyntalk_template_effort(effort, cap):
+    """The level the template gets, as the engine computes it from the same text
+    (template_reasoning_effort in arcint's src/core/chat.cpp), or None for no level.
+    A render without it hashes differently on any template that reads the variable."""
+    material = cap.get("material") if isinstance(cap, dict) else None
+    template = material.get("chat_template") if isinstance(material, dict) else None
+    src = template.get("text") if isinstance(template, dict) else None
+    if not isinstance(effort, str) or not isinstance(src, str) or "reasoning_effort" not in src:
+        return None
+    level = "low" if effort == "minimal" else effort
+    if level not in ("low", "medium", "high", "xhigh"):
+        return None
+    if _template_quotes(src, level):
+        return level
+    if level == "high" and _template_quotes(src, "xhigh"):
+        return "xhigh"
+    if level == "xhigh":
+        return "high"
+    return level
+
+
+def _feyntalk_render(cap, messages, tools, enable, preserve=None, effort=None):
     extra = {}
     if enable is not None:
         extra["enable_thinking"] = enable
+    level = _feyntalk_template_effort(effort, cap)
+    if level is not None:
+        extra["reasoning_effort"] = level
     if preserve is not None:
         extra["preserve_thinking"] = bool(preserve)
     return cap["renderer"].render(messages, tools=tools, add_generation_prompt=True,
@@ -2422,7 +2478,7 @@ def _feyntalk_exact_tokens(cap, rendered, auth):
             pass
 
 
-def _feyntalk_think_policy(cap, messages, tools, enable, override, model, auth=None):
+def _feyntalk_think_policy(cap, messages, tools, enable, override, model, auth=None, effort=None):
     """Denken behalten oder als erste Kompaktierungsstufe fallen lassen.
 
     Rueckgabe (preserve, rendered, mode): preserve True/False/None (None = die
@@ -2435,11 +2491,11 @@ def _feyntalk_think_policy(cap, messages, tools, enable, override, model, auth=N
     so bleibt eine einmal getroffene Entscheidung stabil, statt an einem
     einzelnen Fehlschlag zu kippen."""
     if enable is False or not cap.get("supports_preserve_thinking"):
-        return None, _feyntalk_render(cap, messages, tools, enable), "off"
+        return None, _feyntalk_render(cap, messages, tools, enable, effort=effort), "off"
     if override is not None:
-        rendered = _feyntalk_render(cap, messages, tools, enable, override)
+        rendered = _feyntalk_render(cap, messages, tools, enable, override, effort=effort)
         return override, rendered, ("kept" if override else "dropped")
-    rendered = _feyntalk_render(cap, messages, tools, enable, True)
+    rendered = _feyntalk_render(cap, messages, tools, enable, True, effort=effort)
     n_ctx = cap.get("n_ctx")
     if not isinstance(n_ctx, int) or n_ctx <= 0:
         _feyntalk_log_once(cap["hash"] + "|noctx",
@@ -2473,7 +2529,7 @@ def _feyntalk_think_policy(cap, messages, tools, enable, override, model, auth=N
                                f"({why}); using the "
                                + ("scaled estimate" if ratio is not None else "estimate"))
     if count > limit:
-        dropped = _feyntalk_render(cap, messages, tools, enable, False)
+        dropped = _feyntalk_render(cap, messages, tools, enable, False, effort=effort)
         gezaehlt = (f"{count:.0f} tokens ({source})" if source == "exact"
                     else f"~{count:.0f} tokens ({source})")
         _feyntalk_log_once(cap["hash"] + "|drop",
@@ -2526,7 +2582,7 @@ def _feyntalk_chat_request(body, cap, model, client_stream, auth=None):
     override = _feyntalk_client_preserve_chat(request)
     preserve, rendered, think = _feyntalk_think_policy(
         cap, render_messages, tools_render, enable, override, model,
-        auth=auth)
+        auth=auth, effort=effort)
 
     out = {"model": model, "input": input_items, "stream": True,
            "arcint": _feyntalk_arcint(cap, rendered, preserve)}
@@ -2567,11 +2623,11 @@ def _feyntalk_responses_request(body, cap, model, auth=None):
         _responses_messages_from_input(request.get("input"), request.get("instructions")),
         cap.get("object_arguments"))
     tools_render = _responses_tools_for_render(request.get("tools"))
-    enable, _effort = _feyntalk_enable(model, request, chat=False)
+    enable, effort = _feyntalk_enable(model, request, chat=False)
     override = _feyntalk_client_preserve_responses(request)
     preserve, rendered, think = _feyntalk_think_policy(
         cap, render_messages, tools_render, enable, override, model,
-        auth=auth)
+        auth=auth, effort=effort)
 
     out = dict(request)
     out["stream"] = True
@@ -2591,18 +2647,43 @@ def _feyntalk_model_of(body):
     return model if isinstance(model, str) else ""
 
 
+def _local_thinking_switch(j):
+    """Text path: set enable_thinking for a reasoning model unless the client did.
+    It follows reasoning_effort, because the engine lets this switch win over the effort.
+    Returns True if the request changed."""
+    ck = j.get("chat_template_kwargs")
+    ck = ck if isinstance(ck, dict) else {}
+    if "enable_thinking" in ck:
+        return False
+    ck["enable_thinking"] = j.get("reasoning_effort") not in ("none", "off")
+    j["chat_template_kwargs"] = ck
+    return True
+
+
 def _feyntalk_prepare(backend, method, path, body, feyntalk=None, auth=None):
     """None = the text path, unchanged. A dict = send this token-mode request.
+
+    An alias with feyntalk "tokens" (the `-ft` names) has no text path: whatever would
+    send it there raises _FeyntalkStrict instead.
 
     `feyntalk` overrides the backend's own setting for this request (the alias's
     mode); None keeps the backend setting. `auth` ist die Authorization des
     Anrufers, wie sie auch an die Engine-Routen geht -- /tokenize liegt hinter
     demselben Schluessel und bekommt darum dieselbe Kopfzeile."""
     name = backend[0]
+    strict = feyntalk == "tokens"
     if method != "POST" or (_feyntalk_setting(name) if feyntalk is None else feyntalk) == "off":
         return None
     cap = _feyntalk_capability(backend, setting=feyntalk)
+    if strict and cap.get("mode") != "tokens":
+        # A cached "no token mode" can outlive a unit restart; ask again before failing.
+        _feyntalk_drop_cache(name)
+        cap = _feyntalk_capability(backend, setting=feyntalk)
     if cap.get("mode") != "tokens":
+        if strict:
+            raise _FeyntalkStrict(502, "token_mode_unavailable",
+                                  f"backend '{name}' cannot serve token mode: "
+                                  f"{cap.get('reason', 'unknown reason')}")
         return None
     model = _feyntalk_model_of(body)
     try:
@@ -2611,12 +2692,20 @@ def _feyntalk_prepare(backend, method, path, body, feyntalk=None, auth=None):
         if "/chat/completions" in path:
             is_stream = bool(json.loads(body).get("stream"))
             return _feyntalk_chat_request(body, cap, model, is_stream, auth=auth)
+        if strict:
+            raise _FeyntalkStrict(400, "token_mode_unsupported_request",
+                                  f"token mode does not serve {path}")
         return None
     except _FeyntalkRefusal as e:
+        if strict:
+            raise _FeyntalkStrict(400, "token_mode_unsupported_request", str(e)) from e
         _feyntalk_log_once(name + "|request|" + str(e),
                            f"feyntalk: {name} request stays text ({e})")
         return None
     except (ValueError, _FTRenderError) as e:
+        if strict:
+            raise _FeyntalkStrict(502, "token_mode_unavailable",
+                                  f"backend '{name}' render failed: {type(e).__name__}: {e}") from e
         _feyntalk_log_once(name + "|render|" + str(e),
                            f"feyntalk: {name} render stays text ({type(e).__name__}: {e})")
         return None
@@ -4090,6 +4179,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
         rid = self._rid_jetzt()
         super().send_response(code, message)
         self.send_header("X-Request-Id", rid)
+        if getattr(self, "_ft_path", None):
+            self.send_header("X-Llm-Proxy-Path", self._ft_path)
 
     def _backend_rid_pruefen(self, resp, backend_name, method, path, hint):
         """Der Backend-Wert weicht ab: das Gateway hat seinen geschickt, das
@@ -4873,6 +4964,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
             client_frist_gesetzt = True
         except OSError:
             pass
+        strict = feyntalk == "tokens"
+        self._ft_path = None
         try:
             token_request = _feyntalk_prepare(backend, method, path, body, feyntalk,
                                                auth=fwd.get("Authorization"))
@@ -4905,10 +4998,42 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 raise ConnectionResetError(
                     "Backend-Verbindung waehrend getresponse() geschlossen")
             self._backend_rid_pruefen(resp, name, method, path, hint)
+            kind_409 = None
+            if strict and token_request and resp.status == 409:
+                kind_409 = _feyntalk_409_kind(resp.read())
+            if kind_409 == "material":
+                # The material moved, which a unit restart does legitimately: fetch it again
+                # and try this turn once more in token mode. A second 409 fails below.
+                _feyntalk_drop_cache(name)
+                log(f"{method} {path} -> {name} feyntalk 409 renderer hash moved; "
+                    f"dropping capability cache, retrying once in token mode (strict)")
+                self._close_backend(conn)
+                token_request = _feyntalk_prepare(backend, method, path, body, feyntalk,
+                                                   auth=fwd.get("Authorization"))
+                send_body = token_request["body"]
+                fwd_use["Content-Length"] = str(len(send_body))
+                conn = http.client.HTTPConnection(host, port,
+                                                  timeout=CONNECT_TIMEOUT if not is_last else READ_TIMEOUT)
+                conn.request(method, token_request["path"], body=send_body, headers=fwd_use)
+                backend_sock = conn.sock
+                resp = conn.getresponse()
+                if resp is None:
+                    raise ConnectionResetError(
+                        "Backend-Verbindung waehrend getresponse() geschlossen")
+                self._backend_rid_pruefen(resp, name, method, path, hint)
+                kind_409 = "moved again" if resp.status == 409 else None
+            if kind_409 is not None or (strict and token_request and resp.status == 409):
+                wort = {"moved again": "renderer hash moved twice", "prompt": "prompt mismatch"}.get(
+                    kind_409, "renderer mismatch")
+                log(f"{method} {path} -> {name} feyntalk 409 {wort}; failing this turn (strict){hint}")
+                raise _FeyntalkStrict(502, "renderer_mismatch",
+                                      f"backend '{name}' refused the token-mode render: {wort}")
             if token_request and resp.status == 409:
                 # The engine refused before any token and before the slot was
                 # used for generation: re-send the same turn once as a text
                 # request. This is the D6 fallback, logged, never silent.
+                # Only names without a `-ft` alias get here.
+                _feyntalk_count(name, "fallbacks")
                 err_body = resp.read()
                 kind = _feyntalk_409_kind(err_body)
                 if kind == "material":
@@ -4938,7 +5063,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
                         "Backend-Verbindung waehrend getresponse() geschlossen")
                 self._backend_rid_pruefen(resp, name, method, path, hint)
                 token_request = None
+            self._ft_path = "tokens" if token_request else "text"
             if token_request:
+                _feyntalk_count(name, "tokens")
                 if token_request["kind"] == "chat":
                     self._stream_chat_from_tokens(resp, name, t0, t_try, hint, method, path,
                                                   token_request, sock=backend_sock, gone_evt=gone)
@@ -4951,6 +5078,12 @@ class Handler(http.server.BaseHTTPRequestHandler):
                                       chatml_guard=getattr(self, "_chatml_guard", False), sock=backend_sock)
             self._close_backend(conn)
             return "ok"
+        except _FeyntalkStrict as e:
+            self._close_backend(conn)
+            _feyntalk_count(name, "errors")
+            self._feyntalk_strict = e
+            log(f"{method} {path} -> {name} {e.status} {e.code}: {e.message}{hint}")
+            return "strict"
         except _FeyntalkBadRequest as e:
             # Ungueltiges preserve_thinking des Anrufers: 400, nicht an das
             # Backend weiterleiten und nicht in den Textmode fallen.
@@ -5077,6 +5210,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 return
             if r == "aborted":
                 return          # client hung up; nothing to send, don't fail over
+            if r == "strict":
+                self._send_feyntalk_strict()
+                return
             if r == "badrequest":
                 self._send_error(400, json.dumps({"error": {
                     "message": getattr(self, "_feyntalk_bad_request",
@@ -5114,6 +5250,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 return
             if r == "aborted":
                 return          # client hung up; nothing to send, don't fail over
+            if r == "strict":
+                self._send_feyntalk_strict()
+                return
             if r == "badrequest":
                 self._send_error(400, json.dumps({"error": {
                     "message": getattr(self, "_feyntalk_bad_request",
@@ -5128,6 +5267,11 @@ class Handler(http.server.BaseHTTPRequestHandler):
         else:
             self._send_error(502, b'{"error":"all local backends down"}')
             log(f"{method} {path} -> ALL_DOWN total={time.monotonic()-t0:.2f}s{hint}")
+
+    def _send_feyntalk_strict(self):
+        e = self._feyntalk_strict
+        self._send_error(e.status, json.dumps({"error": {
+            "message": e.message, "type": "feyntalk_error", "code": e.code}}).encode())
 
     def _proxy_zen(self, method, path, body, hint, t0, is_streaming=False):
         upstream_path = "/zen/v1/chat/completions"
@@ -5337,6 +5481,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
         # reist an jeden Upstream-Versuch, steht in Antwort und Logzeile.
         self._rid = _anfrage_rid(self.headers.get("X-Request-Id"))
         self._rid_ersetzt_gemeldet = False
+        self._ft_path = None        # keep-alive: never the previous request's path
         hint = f" rid={self._rid}"
         try:
             self._cors_origin = None
@@ -5352,7 +5497,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 self._cors_origin = origin
 
             if method == "GET" and path in ("/health", "/v1/health"):
-                resp_body = json.dumps({"status":"ok"}).encode()
+                with _FEYNTALK_COUNTS_LOCK:
+                    counts = {k: dict(v) for k, v in FEYNTALK_COUNTS.items()}
+                resp_body = json.dumps({"status": "ok", "feyntalk": counts}).encode()
                 self.send_response(200)
                 self.send_header("Content-Type", "application/json")
                 self.send_header("Content-Length", str(len(resp_body)))
@@ -5512,13 +5659,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
                             body = json.dumps(j).encode()
                             hint += f" effort_mapped={_new}"
 
-                    if _local_reasoning(model):
-                        ck = j.get("chat_template_kwargs")
-                        ck = ck if isinstance(ck, dict) else {}
-                        if "enable_thinking" not in ck:
-                            ck["enable_thinking"] = True
-                            j["chat_template_kwargs"] = ck
-                            body = json.dumps(j).encode()
+                    if _local_reasoning(model) and _local_thinking_switch(j):
+                        body = json.dumps(j).encode()
 
                     # ChatML-Marker als Stop-Strings fuer LOKALE Backends.
                     #
@@ -5631,6 +5773,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
     def do_OPTIONS(self):
         self._rid = _anfrage_rid(self.headers.get("X-Request-Id"))
         self._rid_ersetzt_gemeldet = False
+        self._ft_path = None        # keep-alive: never the previous request's path
         self._cors_gesetzt = False
         origin = self.headers.get("Origin")
         self._cors_origin = origin if origin and _origin_allowed(origin) else None

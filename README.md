@@ -201,7 +201,7 @@ backend takes exactly the paths it took before.
 | value | meaning |
 |---|---|
 | absent / `"off"` | never ask, never change the request or the stream |
-| `"tokens"` | ask `/props` + `/v1/responses/renderer`; token mode when the engine is ready, text mode (logged) otherwise |
+| `"tokens"` | ask `/props` + `/v1/responses/renderer`; token mode when the engine is ready. On a backend: text mode (logged) otherwise. On a `-ft` alias: an error otherwise, never the text path |
 | `"text"` | pin text mode without asking |
 
 Requires `feyntalk-render` (Python 3.11+, Jinja2 3.1.6) importable by the proxy.

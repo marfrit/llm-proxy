@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 """Fallback review: jeder Text-Rueckfall laeuft durch den echten Anfragepfad.
 
-Bild-Teile (Chat image_url, Responses input_image) und Render-Fehler muessen
-Text bleiben, eine Logzeile schreiben und das Backend als Textauftrag
-erreichen - fuer den klassischen Namen UND den -ft-Alias. Dazu der
+Bild-Teile (Chat image_url, Responses input_image) und Render-Fehler muessen beim
+klassischen Namen Text bleiben, eine Logzeile schreiben und das Backend als
+Textauftrag erreichen. Der -ft-Alias hat keinen Textpfad: er
+scheitert mit dem Grund und erreicht das Backend nicht. Dazu der
 Versions-Handshake: der installierte Renderer besteht das Gate, _version_tuple
 ordnet Vorab-Releases kleiner ein als die Freigabe.
 """
@@ -93,12 +94,17 @@ def body_has_token(body_bytes):
 
 material = make_material()
 
-# 1) Bild im Chat: Text bleibt Text, mit Logzeile, fuer klassisch und -ft.
+# 1) Bild im Chat: Text bleibt Text, mit Logzeile; -ft scheitert.
 srv, E = start_engine(material, caps=CAPS, n_ctx=100000)
 reset("eng", *srv.server_address[:2], setting="tokens")
 lp.MODEL_ALIASES = {"qwen-ft": {"model": MODEL, "feyntalk": "tokens"}}
 px = Proxy()
-for name in (MODEL, "qwen-ft"):
+E.paths.clear()
+out, status = px.post(chat_body("qwen-ft", IMAGE_CHAT))
+check(status == 400 and b"token_mode_unsupported_request" in out, f"Bild (Chat, -ft): {status} {out[:100]!r}")
+check("POST /v1/responses" not in E.paths and "POST /v1/chat/completions" not in E.paths,
+      f"Bild (Chat, -ft) erreichte das Backend: {E.paths}")
+for name in (MODEL,):
     E.paths.clear(); E.bodies.clear(); del lp._testlog[:]; lp._FEYNTALK_WARNED.clear()
     out, status = px.post(chat_body(name, IMAGE_CHAT))
     check(status == 200, f"Bild (Chat, {name}) ergab Status {status}")
@@ -115,7 +121,9 @@ srv, E = start_engine(material, caps=CAPS, n_ctx=100000)
 reset("eng", *srv.server_address[:2], setting="tokens")
 lp.MODEL_ALIASES = {"qwen-ft": {"model": MODEL, "feyntalk": "tokens"}}
 px = Proxy()
-for name in (MODEL, "qwen-ft"):
+out, status = px.post(resp_body("qwen-ft", IMAGE_RESP), path="/v1/responses")
+check(status == 400 and b"token_mode_unsupported_request" in out, f"Bild (Responses, -ft): {status} {out[:100]!r}")
+for name in (MODEL,):
     E.paths.clear(); E.bodies.clear(); del lp._testlog[:]; lp._FEYNTALK_WARNED.clear()
     out, status = px.post(resp_body(name, IMAGE_RESP), path="/v1/responses")
     check(status == 200, f"Bild (Responses, {name}) ergab Status {status}")
@@ -125,7 +133,7 @@ for name in (MODEL, "qwen-ft"):
           f"Bild (Responses, {name}) ohne Logzeile: {lp._testlog[-2:]}")
 px.close(); srv.shutdown()
 
-# 3) Render-Fehler: derselbe Rueckfall, beide Routen, klassisch und -ft.
+# 3) Render-Fehler: derselbe Rueckfall, beide Routen, klassisch; -ft scheitert.
 srv, E = start_engine(material, caps=CAPS, n_ctx=100000)
 reset("eng", *srv.server_address[:2], setting="tokens")
 lp.MODEL_ALIASES = {"qwen-ft": {"model": MODEL, "feyntalk": "tokens"}}
@@ -139,7 +147,11 @@ def _boom(self, *a, **k):
 lp._FTRenderer.render = _boom
 px = Proxy()
 try:
-    for name in (MODEL, "qwen-ft"):
+    out, status = px.post(chat_body("qwen-ft", [{"type": "text", "text": "hi"}]))
+    check(status == 502 and b"token_mode_unavailable" in out, f"Render-Fehler (Chat, -ft): {status} {out[:100]!r}")
+    out, status = px.post(resp_body("qwen-ft", [{"type": "input_text", "text": "hi"}]), path="/v1/responses")
+    check(status == 502 and b"token_mode_unavailable" in out, f"Render-Fehler (Responses, -ft): {status} {out[:100]!r}")
+    for name in (MODEL,):
         E.paths.clear(); E.bodies.clear(); del lp._testlog[:]; lp._FEYNTALK_WARNED.clear()
         out, status = px.post(chat_body(name, [{"type": "text", "text": "hi"}]))
         check(status == 200 and not body_has_token(E.bodies.get("/v1/responses")),

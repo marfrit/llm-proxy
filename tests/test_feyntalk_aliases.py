@@ -5,7 +5,7 @@ ROT, wenn ein Alias nicht in seinem Modus laeuft, ein unbekannter feyntalk-Wert
 nicht uebersprungen wird, der Alias nicht vom Ziel erbt, /v1/models den Alias
 nicht als alias_of markiert, ein -down-Ziel nicht -down vererbt, der Handshake
 einen zu alten Renderer / eine zu alte Engine nicht ablehnt, oder der Alias
-scheitert, wo der klassische Name im Textmodus funktioniert.
+scheitert still, wo der klassische Name im Textmodus funktioniert.
 """
 import http.server
 import io
@@ -172,16 +172,16 @@ for kw in ({"engine_version": "1.3.0"}, {"contract": 2}):
           f"Engine-Handshake {kw} nutzte Tokenmodus: {E.paths}")
     px.close(); srv.shutdown()
 
-# 7) Alias scheitert nicht, wo der klassische Name textet (Engine nicht bereit).
+# 7) Engine nicht bereit: der klassische Name textet, der Alias scheitert laut.
 srv, E = start_engine(material, n_ctx=100000, token_mode="off")
 reset("eng", *srv.server_address[:2], setting="off")
 lp.MODEL_ALIASES = {"qwen-ft": {"model": MODEL, "feyntalk": "tokens"}}
 px = Proxy()
 klassisch, s1 = px.post(chat_body(model=MODEL))
 alias, s2 = px.post(chat_body(model="qwen-ft"))
-check(s1 == 200 and s2 == 200, f"Status klassisch={s1} alias={s2}")
-check(klassisch.count(b"data: ") > 0 and alias.count(b"data: ") > 0,
-      f"Textstrom fehlt: klassisch={klassisch[:40]!r} alias={alias[:40]!r}")
+check(s1 == 200 and s2 == 502, f"Status klassisch={s1} alias={s2}")
+check(klassisch.count(b"data: ") > 0 and b"token_mode_unavailable" in alias,
+      f"klassisch={klassisch[:40]!r} alias={alias[:80]!r}")
 check("POST /v1/responses" not in E.paths, f"nicht bereite Engine wurde tokenisiert: {E.paths}")
 px.close(); srv.shutdown()
 

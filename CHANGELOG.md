@@ -1,5 +1,23 @@
 # Changelog
 
+## 1.3.3 - 2026-11-06
+
+- **Effort im Render.** `_feyntalk_render` gab nur `enable_thinking` an die Vorlage,
+  die Engine aber auch die Stufe. Auf jeder Vorlage, die `reasoning_effort` liest
+  (Qwen3.8), wich `prompt_sha256` darum ab: jeder Zug mit Effort bekam 409 und lief
+  still als Text. Jetzt rendert der Proxy mit derselben Stufe wie die Engine
+  (`_feyntalk_template_effort`, Abbildung wie `template_reasoning_effort` in arcint).
+- **`none`/`off` schalten das Denken ab.** Der Textpfad setzte `enable_thinking: true`
+  auch bei `reasoning_effort: "none"`, und das schlaegt den Effort in der Engine: die
+  Vorlage dachte auf ihrem Standard weiter. `off` zaehlt auf dem Tokenpfad jetzt wie `none`.
+- **`-ft` scheitert laut.** Ein Alias mit `"feyntalk": "tokens"` hat
+  keinen Textpfad mehr: 409 Prompt/Renderer -> `502 renderer_mismatch`, kein Token-Modus ->
+  `502 token_mode_unavailable` (nach einmal neu fragen), Anfrage, die der Token-Modus nicht
+  kann -> `400 token_mode_unsupported_request`. Ein bewegter Material-Hash holt einmal neu und
+  versucht einmal im Token-Modus. Namen ohne Alias behalten den Text-Rueckfall.
+- **Sichtbarkeit.** `X-Llm-Proxy-Path: tokens|text` an jeder lokalen Antwort, `/health` traegt
+  je Backend `tokens`, `fallbacks`, `errors`.
+
 ## 1.3.2 - 2026-11-02
 
 - **Kontext-Waechter am Chat-Rand.** Die Engine meldet mit `arcint:context`

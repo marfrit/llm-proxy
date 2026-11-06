@@ -24,10 +24,14 @@ engine runs and translates the engine's token stream back into Chat output.
 
 ## What it refuses
 
-- An **unknown or mismatched renderer material hash** — the turn falls back to
-  the text path with one log line.
-- A **renderer older than 1.0.0** or an **engine contract mismatch** — same
-  fallback, never a failed request.
+- An **unknown or mismatched renderer material hash** — on a name without a token
+  alias the turn falls back to the text path with one log line. On a `-ft` alias
+  (`"feyntalk": "tokens"`) it fails with `502` and `code: renderer_mismatch`; only a
+  moved hash gets one fresh fetch and one more token attempt first.
+- A **renderer older than 1.0.0** or an **engine contract mismatch** — same split:
+  text path with a log line, or on a `-ft` alias `502` and `code: token_mode_unavailable`.
+  A request token mode cannot serve fails there with `400` and
+  `code: token_mode_unsupported_request`.
 - A **non-boolean client switch** (`chat_template_kwargs.preserve_thinking`,
   `arcint.preserve_thinking`) — answered with `400` and never forwarded.
 - A request whose model is known but fails the cost policy, with `403`, before
