@@ -384,15 +384,32 @@ correction, not the source: a `max_output` the backend itself reports always win
 only fills silence. Only positive ints and floats are kept (cast to int); `true`, strings, zero
 and negatives are dropped. Reloaded on `SIGHUP` like the other files.
 
+## Native providers
+
+`$LLM_PROXY_CONFIG_DIR/native-providers.json` (see `native-providers.example.json`) adds OpenAI-compatible
+clouds next to OpenRouter, one entry per id prefix:
+
+    {"myplan": {"base_url": "https://api.example.com/compatible-mode/v1",
+                "key_file": "/etc/llm-proxy/keys/myplan", "cost_class": "paid", "owned_by": "my-plan",
+                "models": {"model-a": {}, "model-b": {"prompt_price": 0.0000004}}}}
+
+The catalog lists `[$] myplan/model-a` (or `[free] ...` for `cost_class: free`) while the key is set.
+Only the listed models are offered and routed, only `POST /v1/chat/completions` is forwarded, and the
+provider's cost class is what the cost regulator sees, whatever tag a client writes. The key comes from
+`key_file` (one line, mode 0600) or `key_env` (an environment variable that must reach the service);
+it never appears in responses or the log. `prompt_price` ($/token, as OpenRouter's pricing) lets mode
+`cheap` decide; without it `cheap` refuses the model and does not list it.
+
 ## Signals
 
-- `SIGHUP` — reload `local-backends.json`, `friendly-names.json`, `reasoning-models.json`, `local-ctx.json`, `local-max-output.json`, `model-aliases.json`, `reasoning-effort-map.json` (the last one since 1.0.9). `rc-service llm-proxy reload` sends it (packaged init script since 1.0.9).
+- `SIGHUP` — reload `local-backends.json`, `friendly-names.json`, `reasoning-models.json`, `local-ctx.json`, `local-max-output.json`, `model-aliases.json`, `reasoning-effort-map.json` (since 1.0.9), `native-providers.json` (since 1.3.5). `rc-service llm-proxy reload` sends it (packaged init script since 1.0.9).
 - `SIGUSR1` — drop discovery caches and re-check the cloud catalog now.
 
 ## Scope
 
-llm-proxy has no virtual keys, budgets, caching, observability callbacks, admin
-UI, or native non-OpenRouter providers. It trades those for a single
+llm-proxy has no virtual keys, budgets, caching, observability callbacks or admin
+UI. Besides OpenRouter it routes to further OpenAI-compatible clouds only through
+an explicit allow-list (`native-providers.json`, see below). It trades those for a single
 dependency-free file plus OpenRouter free/cheap-tier auto-curation. For the
 larger feature set, use a full gateway such as litellm.
 

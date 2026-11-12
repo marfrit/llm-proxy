@@ -152,6 +152,27 @@ def engine_stream(case, context=None, loop_guard=None, truncated=None):
     head = sse({"type": "response.created",
                 "response": {"id": "resp_fixture", "created_at": 1700000000,
                              "status": "in_progress"}})
+    if case == "cut":
+        # a thinking block that never closed (the turn hit max_output_tokens): reasoning only.
+        # The engine ends the span at the last token with closed:false (Dory capture
+        # 2026-11-11, c4: start 0 {preopened}, end 47 {closed:false}, response.incomplete).
+        events = [
+            span_event("thinking", "start", 0, {"preopened": True}),
+            token_event(0, 10, "reasoning"),
+            token_event(1, 21, "reasoning"),
+            token_event(2, 20, "reasoning"),
+            span_event("thinking", "end", 2, {"closed": False}),
+        ]
+        out = head + b"".join(sse(e) for e in events)
+        out += sse({"type": "response.incomplete",
+                    "response": {"id": "resp_fixture", "created_at": 1700000000,
+                                 "status": "incomplete",
+                                 "incomplete_details": {"reason": "max_output_tokens"},
+                                 "output": [],
+                                 "usage": {"input_tokens": 11, "output_tokens": 3,
+                                           "total_tokens": 14}}})
+        out += b"data: [DONE]\n\n"
+        return out
     if case == "tool":
         events = [
             span_event("thinking", "start", 0, {"preopened": True}),
@@ -224,7 +245,7 @@ def start_engine(material, mode="ok", case="answer", caps=None, n_ctx=None,
                  engine_version="1.4.0", contract=1, token_mode="ready",
                  param="arcint.renderer_mismatch", renderer_delay=0.0,
                  tokenize_count=None, tokenize_status=200, tokenize_delay=0.0,
-                 tokenize_shape="count"):
+                 tokenize_shape="count", kwargs_default=None):
     """(server, handler class). mode '409' refuses the token request before it is served.
 
     `caps` is the engine's /props chat_template_caps object; None leaves it out
@@ -238,7 +259,8 @@ def start_engine(material, mode="ok", case="answer", caps=None, n_ctx=None,
     an error status (404/500/...). `tokenize_shape` is "count" ({tokens,count})
     or "tokens" (only {tokens}, the older content shape). `tokenize_delay` sleeps
     before answering, for the timeout path. Hits and headers are recorded on the
-    handler class (`tokenize_hits`, `tokenize_auth`)."""
+    handler class (`tokenize_hits`, `tokenize_auth`). `kwargs_default` is /props
+    chat_template_kwargs_default (the unit's --chat-template-kwarg values), None leaves it out."""
     class E(BaseHTTPRequestHandler):
         paths = []
         bodies = {}
@@ -282,6 +304,8 @@ def start_engine(material, mode="ok", case="answer", caps=None, n_ctx=None,
                            "arcint": {"v": E.contract}}
                 if E.caps is not None:
                     payload["chat_template_caps"] = E.caps
+                if E.kwargs_default is not None:
+                    payload["chat_template_kwargs_default"] = E.kwargs_default
                 if E.n_ctx is not None:
                     payload["model"] = {"n_ctx": E.n_ctx}
                 self._json(payload)
@@ -349,6 +373,7 @@ def start_engine(material, mode="ok", case="answer", caps=None, n_ctx=None,
     E.loop_guard = loop_guard
     E.truncated = truncated
     E.caps = caps
+    E.kwargs_default = kwargs_default
     E.n_ctx = n_ctx
     E.engine_version = engine_version
     E.contract = contract

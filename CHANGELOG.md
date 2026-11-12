@@ -1,5 +1,24 @@
 # Changelog
 
+## 1.3.5 - 2026-11-12
+
+- **Native Anbieter (`native-providers.json`).** Weitere OpenAI-kompatible Clouds neben OpenRouter und Zen,
+  etwa ein Abo-Endpunkt. Je Eintrag ein id-Praefix mit `base_url`, Schluessel aus `key_file` (eine Zeile,
+  0600; das paketierte Init-Skript reicht nur `OPENROUTER_API_KEY` durch) oder `key_env`, `cost_class`
+  (`paid`|`free`), `owned_by` und einer Positivliste der Modelle. Katalog-ids `[$] <praefix>/<modell>`; die
+  Kostenklasse des Anbieters gilt unabhaengig vom Tag, den der Client schreibt; `cheap` liest einen
+  angegebenen `prompt_price` oder weist ab (und listet dann nicht). Weitergeleitet wird nur
+  `POST /v1/chat/completions` (fester Pfad, sonst 404), Bearer, 4xx/429 durch (Retry-After), 5xx -> 502.
+  Ein Schluessel mit CR/LF oder Leerzeichen zaehlt als nicht gesetzt; weder Antwort noch Log zeigen ihn.
+  Praefixe, die einen OpenRouter-Anbieter oder `opencode` ueberdecken, werden abgewiesen. SIGHUP laedt neu.
+- **`force_nonempty_content` im Token-Modus.** Die Engine nimmt Token-Zuege von dieser Regel aus; der Proxy
+  wendet sie an wie arcints `promote_reasoning_to_content`: an (Anfrage-`chat_template_kwargs` gewinnt, auch
+  ein `false`; sonst die Unit-Voreinstellung aus `/props` `chat_template_kwargs_default`), Denken nicht leer,
+  Antwort leer -> das Denken wird zur Antwort. Token-Modus zusaetzlich: kein Tool-Aufruf im Zug. Chat-Strom:
+  die Denk-Deltas wie bisher, dann ein Inhalts-Delta, kein Tool-Delta; ohne Strom `content` = Denken, kein
+  `reasoning_content`. Leer = ASCII-Leerraum wie `text_is_blank`. Der Responses-Durchgang bleibt unveraendert.
+  Geprueft an einer Dory1.0-4B-Aufzeichnung: Rendering 12/12 bytegleich zur Engine.
+
 ## 1.3.4 - 2026-11-06
 
 - **`-ft` ohne Strom.** Der Proxy haengt nicht-gestreamten lokalen Anfragen ChatML-Stop-Strings an, und der

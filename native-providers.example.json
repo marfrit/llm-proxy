@@ -1,0 +1,12 @@
+{
+  "myplan": {
+    "base_url": "https://api.example.com/compatible-mode/v1",
+    "key_file": "/etc/llm-proxy/keys/myplan",
+    "cost_class": "paid",
+    "owned_by": "my-plan",
+    "models": {
+      "model-a": {},
+      "model-b": {"ctx": 131072, "prompt_price": 0.0000004}
+    }
+  }
+}

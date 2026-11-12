@@ -69,7 +69,7 @@ import hashlib
 import math
 
 # Die eigene Version; geht in die Startzeile und in die Release-Notiz.
-__version__ = "1.3.4"
+__version__ = "1.3.5"
 
 # feyntalk: the optional renderer dependency. The proxy runs without it;
 # token mode is then unavailable and says so once (see _feyntalk_unavailable).
@@ -294,6 +294,95 @@ def _load_local_max_output():
 
 
 LOCAL_MAX_OUTPUT = _load_local_max_output()
+
+
+# --- Native OpenAI-compatible cloud providers (native-providers.json) ------------------------
+#
+# Further clouds next to OpenRouter and Zen, e.g. a subscription endpoint. One entry per id prefix:
+#   {"qwenplan": {"base_url": "https://host/compatible-mode/v1", "key_env": "QWEN_TOKEN_PLAN_KEY",
+#                 "cost_class": "paid", "owned_by": "qwen-token-plan",
+#                 "models": {"qwen3.8-max": {}, "qwen3.8-flash": {"ctx": 131072}}}}
+# Model ids are "<prefix>/<id>"; the catalog shows them as "[$] <prefix>/<id>" (or "[free] ").
+# Only the listed models are offered and routed: a provider's own list also carries image,
+# audio and video models a chat client cannot use, and the list is the place to say so.
+# The key never sits in this file: key_file names a file holding it (one line, mode 0600; read at
+# load and on SIGHUP), or key_env an environment variable. key_file exists because the packaged
+# init script passes only OPENROUTER_API_KEY into the service. A provider without a key is
+# neither listed nor routed.
+_NATIVE_PREFIX_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,31}$")
+_NATIVE_KEY_RE = re.compile(r"[\x21-\x7e]+")   # one printable ASCII token: no CR/LF, no spaces
+
+
+def _load_native_providers():
+    try:
+        with open(os.path.join(CONFIG_DIR, "native-providers.json")) as f:
+            d = json.load(f)
+    except FileNotFoundError:
+        return {}
+    except Exception as e:
+        print("native-providers.json unlesbar: %s" % e)
+        return {}
+    out = {}
+    for prefix, cfg in (d.items() if isinstance(d, dict) else []):
+        try:
+            if not _NATIVE_PREFIX_RE.match(prefix) or not isinstance(cfg, dict):
+                raise ValueError("bad prefix or entry")
+            if prefix == "opencode" or prefix + "/" in globals().get("CLOUD_PREFIXES", ()):
+                raise ValueError("prefix shadows an OpenRouter vendor or Zen")
+            u = urllib.parse.urlsplit(cfg["base_url"])
+            if u.scheme not in ("https", "http") or not u.hostname:
+                raise ValueError("base_url must be http(s)://host/...")
+            cost = cfg.get("cost_class", "paid")
+            if cost not in ("paid", "free"):
+                raise ValueError("cost_class must be paid or free")
+            models = cfg.get("models")
+            if not isinstance(models, dict) or not models:
+                raise ValueError("models must be a non-empty object")
+            key_file, key_env = cfg.get("key_file"), cfg.get("key_env")
+            if not (isinstance(key_file, str) and key_file) and not (isinstance(key_env, str) and key_env):
+                raise ValueError("key_file or key_env missing")
+            key = ""
+            if isinstance(key_file, str) and key_file:
+                try:
+                    with open(key_file) as kf:
+                        key = kf.read().strip()
+                except OSError as e:
+                    raise ValueError(f"key_file unreadable ({type(e).__name__})")
+                if key and not _NATIVE_KEY_RE.fullmatch(key):
+                    raise ValueError("key_file content is not a single printable token (value not shown)")
+            out[prefix] = {
+                "scheme": u.scheme, "host": u.hostname,
+                "port": u.port or (443 if u.scheme == "https" else 80),
+                "path": u.path.rstrip("/"), "key_env": key_env if isinstance(key_env, str) else "",
+                "key_file_value": key, "cost_class": cost,
+                "owned_by": str(cfg.get("owned_by") or prefix),
+                "models": {str(k): (v if isinstance(v, dict) else {}) for k, v in models.items()},
+            }
+        except Exception as e:
+            print("native-providers.json: %s verworfen: %s" % (prefix, e))
+    return out
+
+
+NATIVE_PROVIDERS = _load_native_providers()
+
+
+def _native_of(model):
+    """(prefix, cfg, upstream id) for a listed native-provider model whose key is set, else None."""
+    if not isinstance(model, str) or "/" not in model:
+        return None
+    prefix, _, mid = model.partition("/")
+    cfg = NATIVE_PROVIDERS.get(prefix)
+    if cfg is None or mid not in cfg["models"] or not _native_key(cfg):
+        return None
+    return prefix, cfg, mid
+
+
+def _native_key(cfg):
+    """The provider's key: from key_file (read at load), else from key_env; '' if none."""
+    key = cfg.get("key_file_value") or (os.environ.get(cfg["key_env"], "").strip() if cfg.get("key_env") else "")
+    # a value with CR/LF or spaces would make http.client raise with the header (= the key) in
+    # its message; such a key counts as unset
+    return key if key and _NATIVE_KEY_RE.fullmatch(key) else ""
 
 
 # --- Modell-Aliase mit optionaler Laengengrenze (model-aliases.json) ---------------------------
@@ -1018,7 +1107,7 @@ def reload_backends(signum, frame):
     Admission-Semaphore daranhaengt.
     """
     global LOCAL_BACKENDS, FRIENDLY_NAMES, REASONING_OVERRIDES, LOCAL_CTX_OVERRIDES, MODEL_ALIASES
-    global EFFORT_OVERRIDES, LOCAL_MAX_OUTPUT
+    global EFFORT_OVERRIDES, LOCAL_MAX_OUTPUT, NATIVE_PROVIDERS
     new = _load_local_backends()
     with _backends_lock:
         LOCAL_BACKENDS = new
@@ -1026,6 +1115,7 @@ def reload_backends(signum, frame):
     REASONING_OVERRIDES = _load_reasoning_overrides()
     LOCAL_CTX_OVERRIDES = _load_local_ctx_overrides()
     LOCAL_MAX_OUTPUT = _load_local_max_output()
+    NATIVE_PROVIDERS = _load_native_providers()
     MODEL_ALIASES = _load_model_aliases()
     # bis 1.0.8 fehlte sie hier: ein neuer Eintrag (2026-10-21 ds41-flash, medium->high) wirkte
     # erst nach einem Neustart
@@ -1035,7 +1125,7 @@ def reload_backends(signum, frame):
         f"friendly-names ({len(FRIENDLY_NAMES)}), "
         f"reasoning-models ({len(REASONING_OVERRIDES)}), "
         f"local-ctx ({len(LOCAL_CTX_OVERRIDES)}), local-max-output ({len(LOCAL_MAX_OUTPUT)}), "
-        f"model-aliases ({len(MODEL_ALIASES)}), "
+        f"model-aliases ({len(MODEL_ALIASES)}), native-providers ({len(NATIVE_PROVIDERS)}), "
         f"reasoning-effort-map ({len(EFFORT_OVERRIDES)})")
 
 
@@ -1126,6 +1216,7 @@ def _anfrage_id(raw_model):
         # Metadaten bekannte id, die wirklich auf -na endet, bleibt.
         echt = model in _free_catalog or model in _paid_catalog or model in _model_metadata
         bekannt = model in _free_catalog or model in _paid_catalog
+    echt = echt or _native_of(model) is not None   # a native id that ends in -na is the id itself
     if not echt:
         model = re.sub(r"-na(?=:|$)", "", model)
         with _cloud_catalog_lock:
@@ -1235,6 +1326,11 @@ def _classify(raw_model, model):
     Modellnamen unter mode=free als Kostenverstoss gemeldet wurde. Fehlendes
     Wissen ist aber keine Kostenaussage.
     """
+    native = _native_of(model)
+    if native is not None:
+        # The provider's cost class, whatever tag the client wrote: "[free] qwenplan/x"
+        # must not pass the regulator as free when the plan costs money.
+        return native[1]["cost_class"]
     if raw_model.startswith(TAG_LOCAL):
         # Das Praefix allein ist kein Beweis: "[local] openai/x" ohne lokales Backend
         # ging bis 1.0.2 als 'local' am Regler vorbei und dann - weil das Routing die
@@ -1313,6 +1409,11 @@ def _policy_blocked(raw_model, model, kind=None):
                       "keine Zahl - fail-closed")
     with _cloud_catalog_lock:
         meta = _model_metadata.get(model) or {}
+    native = _native_of(model)
+    if native is not None:
+        # a native provider's model: its price is what native-providers.json states ($/token,
+        # as OpenRouter's pricing.prompt); none stated = unknown = fail-closed under 'cheap'
+        meta = native[1]["models"].get(native[2]) or {}
     price = meta.get("prompt_price")
     try:
         mtok = _pro_mtok(price) if price is not None else None
@@ -1809,6 +1910,9 @@ def _feyntalk_capability(backend, setting=None):
         if cached.get("hash") == served_hash and cached.get("renderer") is not None:
             result = dict(cached)
             result["checked"] = now
+            # Same material, but /props may have changed (a unit restarted with another
+            # --chat-template-kwarg): the props-derived fields follow the fresh /props.
+            result["kwargs_default"] = _feyntalk_kwargs_default(props)
             _feyntalk_store(result, cache_key)
             return result
 
@@ -1875,6 +1979,10 @@ def _feyntalk_capability(backend, setting=None):
               # call arguments wants an object, not the JSON string.
               "object_arguments": bool(isinstance(caps, dict)
                                        and caps.get("supports_object_arguments")),
+              # The unit's --chat-template-kwarg defaults (/props chat_template_kwargs_default):
+              # token-mode turns are exempt from the engine's own output rules, the proxy applies
+              # them (force_nonempty_content, see _feyntalk_force_content).
+              "kwargs_default": _feyntalk_kwargs_default(props),
               # preserve_thinking: nur wenn die Vorlage preserve_thinking liest, darf der
               # Gateway die Flagge senden (sonst byte-gleich wie zuvor).
               "supports_preserve_thinking": bool(
@@ -2412,6 +2520,40 @@ def _feyntalk_arcint(cap, rendered, preserve=None):
     return out
 
 
+def _feyntalk_kwargs_default(props):
+    """/props chat_template_kwargs_default (the unit's --chat-template-kwarg values), {} if absent or odd."""
+    value = props.get("chat_template_kwargs_default") if isinstance(props, dict) else None
+    return value if isinstance(value, dict) else {}
+
+
+_ENGINE_BLANK = " \t\n\r\v\f"   # arcint text_is_blank (src/core/chat.cpp): ASCII whitespace only
+
+
+def _feyntalk_force_content(request, cap):
+    """force_nonempty_content for this turn: the request's chat_template_kwargs win (an
+    explicit false turns it off), else the engine's unit default from /props. The engine
+    exempts token-mode turns from it (the token stream only says which tokens are
+    reasoning), so the proxy applies the rule; arcint's decision is
+    promote_reasoning_to_content in src/core/chat.cpp."""
+    kwargs = request.get("chat_template_kwargs")
+    if isinstance(kwargs, dict) and "force_nonempty_content" in kwargs:
+        return kwargs["force_nonempty_content"] is True
+    default = cap.get("kwargs_default") if isinstance(cap, dict) else None
+    return isinstance(default, dict) and default.get("force_nonempty_content") is True
+
+
+def _feyntalk_promote(force, reasoning, text, calls):
+    """(reasoning, text, promoted). As the engine: the rule is on, the reasoning is not
+    blank and the answer is blank -> the reasoning becomes the answer. Token mode only
+    adds 'and no tool call': a real call lives in its tool_call span, not in the text,
+    so a call turn's text is blank by construction and must not be promoted. A call the
+    model merely quoted inside an open thinking block never becomes a call here (a
+    tool_call span cannot start while thinking is open), it stays text."""
+    if force and not calls and (reasoning or "").strip(_ENGINE_BLANK) and not (text or "").strip(_ENGINE_BLANK):
+        return "", reasoning, True
+    return reasoning, text, False
+
+
 def _feyntalk_client_preserve_chat(request):
     """chat_template_kwargs.preserve_thinking, bool oder None.
 
@@ -2609,7 +2751,8 @@ def _feyntalk_chat_request(body, cap, model, client_stream, auth=None):
     return {"path": "/v1/responses", "body": json.dumps(out).encode(),
             "kind": "chat", "model": model, "stream": client_stream,
             "material": cap["material"], "tools": request.get("tools"),
-            "think": think, "retry_body": _feyntalk_retry_body(body, preserve, True)}
+            "think": think, "retry_body": _feyntalk_retry_body(body, preserve, True),
+            "force_content": _feyntalk_force_content(request, cap)}
 
 
 def _feyntalk_responses_request(body, cap, model, auth=None):
@@ -3184,7 +3327,7 @@ def _checker_loop():
 
 
 def _ziel(kind, model):
-    """Wohin geht die Anfrage: 'local' | 'zen' | 'cloud'.
+    """Wohin geht die Anfrage: 'local' | 'native' | 'zen' | 'cloud'.
 
     Entschieden wird nach der EINSTUFUNG, die der Kostenregler gesehen hat - nie an
     ihr vorbei. Bis 1.0.2 fragte das Routing sie nicht: was als 'local' durch den
@@ -3195,6 +3338,8 @@ def _ziel(kind, model):
     """
     if kind == "local":
         return "local"
+    if model and _native_of(model) is not None:
+        return "native"
     if model and model.startswith("opencode/"):
         return "zen"
     if model and (is_cloud_model(model) or _is_in_any_catalog(model)):
@@ -4417,6 +4562,15 @@ class Handler(http.server.BaseHTTPRequestHandler):
         _emit_deltas()   # der finish()-Schwanz (gehaltener Rest) faellt sonst weg
 
         calls = output.tool_calls
+        out_reasoning, out_text, promoted = _feyntalk_promote(
+            request.get("force_content"), output.reasoning, output.text, calls)
+        if promoted:
+            log(f"{method} {path} -> {backend_name} feyntalk: force_nonempty_content: "
+                f"{len(out_text)} reasoning chars became the content")
+            if client_stream:
+                # as the engine's chat stream: the reasoning already streamed as reasoning
+                # deltas, the promoted text follows as one content delta, no tool call
+                self._client_write(_chat_chunk(rid, model, created, {"content": out_text}))
         output_items = resource.get("output") if isinstance(resource, dict) else None
         finish_reason = _chat_finish_reason(resource, calls)
         usage = _chat_usage(resource)
@@ -4435,9 +4589,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self._client_write(b"data: [DONE]\n\n")
             self._client_flush()
         else:
-            message = {"role": "assistant", "content": output.text or None}
-            if output.reasoning:
-                message["reasoning_content"] = output.reasoning
+            message = {"role": "assistant", "content": out_text or None}
+            if out_reasoning:
+                message["reasoning_content"] = out_reasoning
             if calls:
                 entries = []
                 ids = _chat_tool_call_ids(output_items)
@@ -4448,7 +4602,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     entries.append({"id": call_id, "type": "function",
                                     "function": {"name": call.name, "arguments": call.arguments}})
                 message["tool_calls"] = entries
-                if not output.text:
+                if not out_text:
                     message["content"] = None
             body = {"id": rid, "object": "chat.completion", "created": created, "model": model,
                     "choices": [{"index": 0, "message": message,
@@ -5334,6 +5488,69 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 f"{_anfrage_kurz(body, modell)}")
             self._close_backend(conn)
 
+    def _proxy_native(self, method, path, body, hint, t0, native, is_streaming=False):
+        """A native OpenAI-compatible provider (native-providers.json): the id prefix comes off,
+        Bearer auth from its key. Only chat completions go there (pinned path, POST): nothing
+        else ever carries the provider's key."""
+        prefix, cfg, mid = native
+        name = "native-" + prefix
+        if method != "POST" or path.split("?", 1)[0] != "/v1/chat/completions":
+            self._send_error(404, b'{"error":"only POST /v1/chat/completions is served for this provider"}')
+            log(f"{method} {path} -> {name} refused (only chat completions)")
+            return
+        try:
+            j = json.loads(body)
+            j["model"] = mid
+            # as Zen: a max_tokens that is not a positive int goes (providers reject it)
+            for key in ("max_tokens", "max_completion_tokens"):
+                val = j.get(key)
+                if val is not None and (not isinstance(val, int) or isinstance(val, bool) or val < 1):
+                    j.pop(key, None)
+            body = json.dumps(j).encode()
+        except Exception:
+            self._send_error(400, b'{"error":"request body is not JSON"}')
+            return
+        upstream_path = cfg["path"] + "/chat/completions"
+        fwd = {
+            "Content-Type": "application/json",
+            "Accept": "text/event-stream" if is_streaming else "application/json",
+            "Accept-Encoding": "identity",
+            "Authorization": "Bearer " + _native_key(cfg),
+            "Content-Length": str(len(body)),
+            "X-Request-Id": self._rid_jetzt(),
+        }
+        t_try = time.monotonic()
+        conn = None
+        try:
+            if cfg["scheme"] == "https":
+                conn = http.client.HTTPSConnection(cfg["host"], cfg["port"], timeout=READ_TIMEOUT,
+                                                   context=ssl.create_default_context())
+            else:
+                conn = http.client.HTTPConnection(cfg["host"], cfg["port"], timeout=READ_TIMEOUT)
+            conn.request(method, upstream_path, body=body, headers=fwd)
+            resp = conn.getresponse()
+            self._backend_rid_pruefen(resp, name, method, path, hint)
+            if resp.status >= 400:
+                resp_body = resp.read()
+                # as Zen: the provider's 4xx/429 is a statement and passes through; 5xx -> 502
+                status = resp.status if resp.status < 500 else 502
+                kopf = {}
+                if status == 429 and resp.getheader("Retry-After"):
+                    kopf["Retry-After"] = resp.getheader("Retry-After")
+                self._send_error(status, resp_body, headers=kopf)
+                log(f"{method} {path} -> {name} status={resp.status} model={mid} "
+                    f"ttfb={time.monotonic()-t_try:.2f}s{hint}")
+                self._close_backend(conn)
+                return
+            self._stream_response(resp, name, t0, t_try, hint, method, path, is_streaming=is_streaming)
+            self._close_backend(conn)
+        except Exception as e:
+            # the exception text is not echoed: http.client puts header values (the key) into it
+            err = json.dumps({"error": f"{name}: {type(e).__name__}"}).encode()
+            self._send_error(502, err)
+            log(f"{method} {path} -> {name} FAIL {type(e).__name__} model={mid}{hint}")
+            self._close_backend(conn)
+
     def _proxy_cloud(self, method, path, body, hint, t0, is_streaming=False):
         if not OR_KEY:
             self._send_error(500, b'{"error":"OPENROUTER_API_KEY not set"}')
@@ -5461,6 +5678,17 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 continue
             cloud_models.append(catalog_entry(
                 TAG_FREE + zen_id, "opencode-zen", dict(zen_meta)))
+
+        # Native providers (native-providers.json): only listed models, only with the key set.
+        for prefix, cfg in NATIVE_PROVIDERS.items():
+            if not _native_key(cfg) or not _katalog_zeigt(mode, cfg["cost_class"], False):
+                continue
+            tag = TAG_PAID if cfg["cost_class"] == "paid" else TAG_FREE
+            for mid, meta in cfg["models"].items():
+                if mode == "cheap" and _policy_blocked(tag + prefix + "/" + mid, prefix + "/" + mid,
+                                                       kind=cfg["cost_class"])[0]:
+                    continue   # unpriced or over the limit: 'cheap' would 403 it
+                cloud_models.append(catalog_entry(tag + prefix + "/" + mid, cfg["owned_by"], dict(meta) or None))
 
         n_na = sum(1 for v in catalog_snapshot.values() if v == "na")
         local_entries = local_entries + _alias_catalog_entries(local_entries)
@@ -5743,6 +5971,13 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 return
 
             ziel = _ziel(kind, model)
+            if ziel == "native":
+                native = _native_of(model)
+                if native is None:   # the provider went away between the two looks (SIGHUP)
+                    self._send_error(503, b'{"error":"native provider not configured any more"}')
+                    return
+                self._proxy_native(method, path, body, hint, t0, native, is_streaming=stream)
+                return
             if ziel == "zen":
                 self._proxy_zen(method, path, body, hint, t0, is_streaming=stream)
                 return
