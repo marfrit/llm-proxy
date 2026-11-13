@@ -1,5 +1,13 @@
 # Changelog
 
+## 1.3.6 - 2026-11-13
+
+- **Effort per Kwarg.** `chat_template_kwargs.reasoning_effort` gewinnt vor dem Feld auf oberster Ebene, wie in der
+  Chat-Route der Engine -- im Token-Pfad (`reasoning.effort` an die Responses-Anfrage) und im Denk-Schalter des
+  Textpfads, der vorher nur das obere Feld las (ein Kwarg `none` schaltete dort das Denken ein).
+- **`arcint.dory` im Chat.** Die Schleifenzahl eines Dory-Zuges (Engine: `response.arcint.dory = {loops, reprefill}`
+  am Terminal im Token-Modus) erreicht Chat-Clients als `arcint.dory`, im Strom am Schluss-Chunk, ohne Strom im Objekt.
+
 ## 1.3.5 - 2026-11-12
 
 - **Native Anbieter (`native-providers.json`).** Weitere OpenAI-kompatible Clouds neben OpenRouter und Zen,

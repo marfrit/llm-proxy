@@ -142,7 +142,7 @@ def sse(event):
     return ("data: " + json.dumps(event, ensure_ascii=False) + "\n\n").encode()
 
 
-def engine_stream(case, context=None, loop_guard=None, truncated=None):
+def engine_stream(case, context=None, loop_guard=None, truncated=None, dory=None):
     """The engine's token and span events for one turn, then its terminal.
 
     `loop_guard`, `context` and `truncated` are the turn's object events if the
@@ -215,11 +215,11 @@ def engine_stream(case, context=None, loop_guard=None, truncated=None):
     for ev in (loop_guard, context, truncated):
         if ev is not None:
             out += sse(ev)
-    out += sse({"type": "response.completed",
-                "response": {"id": "resp_fixture", "created_at": 1700000000,
-                             "status": "completed", "output": output,
-                             "usage": {"input_tokens": 11, "output_tokens": 6,
-                                       "total_tokens": 17}}})
+    resp = {"id": "resp_fixture", "created_at": 1700000000, "status": "completed", "output": output,
+            "usage": {"input_tokens": 11, "output_tokens": 6, "total_tokens": 17}}
+    if dory is not None:
+        resp["arcint"] = {"dory": dory}
+    out += sse({"type": "response.completed", "response": resp})
     out += b"data: [DONE]\n\n"
     return out
 
@@ -245,7 +245,7 @@ def start_engine(material, mode="ok", case="answer", caps=None, n_ctx=None,
                  engine_version="1.4.0", contract=1, token_mode="ready",
                  param="arcint.renderer_mismatch", renderer_delay=0.0,
                  tokenize_count=None, tokenize_status=200, tokenize_delay=0.0,
-                 tokenize_shape="count", kwargs_default=None):
+                 tokenize_shape="count", kwargs_default=None, dory=None):
     """(server, handler class). mode '409' refuses the token request before it is served.
 
     `caps` is the engine's /props chat_template_caps object; None leaves it out
@@ -360,7 +360,7 @@ def start_engine(material, mode="ok", case="answer", caps=None, n_ctx=None,
                                               "param": E.param,
                                               "message": "renderer mismatch"}}, 409)
                         return
-                self._sse(engine_stream(E.case, E.context, E.loop_guard, E.truncated))
+                self._sse(engine_stream(E.case, E.context, E.loop_guard, E.truncated, E.dory))
             elif self.path == "/v1/chat/completions":
                 self._sse(chat_text_stream(MODEL))
             else:
@@ -374,6 +374,7 @@ def start_engine(material, mode="ok", case="answer", caps=None, n_ctx=None,
     E.truncated = truncated
     E.caps = caps
     E.kwargs_default = kwargs_default
+    E.dory = dory
     E.n_ctx = n_ctx
     E.engine_version = engine_version
     E.contract = contract

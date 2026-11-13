@@ -69,7 +69,7 @@ import hashlib
 import math
 
 # Die eigene Version; geht in die Startzeile und in die Release-Notiz.
-__version__ = "1.3.5"
+__version__ = "1.3.6"
 
 # feyntalk: the optional renderer dependency. The proxy runs without it;
 # token mode is then unavailable and says so once (see _feyntalk_unavailable).
@@ -2451,6 +2451,12 @@ def _feyntalk_enable(model, body, chat):
         # enable_thinking itself, so the level has to be read before the switch: the
         # switch only says on or off. As in the engine, an explicit switch wins.
         effort = body.get("reasoning_effort")
+        # As the engine's chat route: chat_template_kwargs.reasoning_effort wins over the
+        # top-level field when both are set (it is also what Dory's per-request loop count
+        # reads in token mode, via reasoning.effort on the Responses request).
+        kw_effort = kwargs.get("reasoning_effort") if isinstance(kwargs, dict) else None
+        if isinstance(kw_effort, str) and kw_effort:
+            effort = kw_effort
         if isinstance(effort, str):
             off = effort in ("none", "off")
             if kw is False or (off and kw is not True):
@@ -2798,7 +2804,12 @@ def _local_thinking_switch(j):
     ck = ck if isinstance(ck, dict) else {}
     if "enable_thinking" in ck:
         return False
-    ck["enable_thinking"] = j.get("reasoning_effort") not in ("none", "off")
+    # chat_template_kwargs.reasoning_effort wins over the top-level field (as in _feyntalk_enable
+    # and the engine's chat route); otherwise a kwarg "none" would turn thinking ON here.
+    effort = ck.get("reasoning_effort")
+    if not (isinstance(effort, str) and effort):
+        effort = j.get("reasoning_effort")
+    ck["enable_thinking"] = effort not in ("none", "off")
     j["chat_template_kwargs"] = ck
     return True
 
@@ -4575,6 +4586,13 @@ class Handler(http.server.BaseHTTPRequestHandler):
         finish_reason = _chat_finish_reason(resource, calls)
         usage = _chat_usage(resource)
         arcint = _chat_arcint_object(arcint_events)
+        # Dory's loop count for this turn (engine: response.arcint.dory = {loops, reprefill} on the terminal
+        # resource in token mode, src/api/responses_stream.cpp) travels to the chat client under arcint.dory.
+        ext = resource.get("arcint") if isinstance(resource, dict) else None
+        dory = ext.get("dory") if isinstance(ext, dict) else None
+        if isinstance(dory, dict):
+            arcint = dict(arcint or {})
+            arcint["dory"] = dory
         if not terminal:
             log(f"{method} {path} -> {backend_name} feyntalk: stream ended without a terminal event")
         if client_stream:
